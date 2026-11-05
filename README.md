@@ -72,3 +72,4 @@ make -j$(nproc)
 ./build/qremesh_cli input.obj output.obj 5000
 ```
 # 3dModelRemesher
+# 3dModelRemesher
