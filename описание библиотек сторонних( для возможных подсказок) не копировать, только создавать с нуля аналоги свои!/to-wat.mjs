@@ -1,0 +1,10 @@
+import wabt from 'wabt';
+import fs from 'fs';
+const w = await wabt();
+const buf = fs.readFileSync('meshopt_simplifier.wasm');
+const mod = w.readWasm(buf, {readDebugNames: true});
+mod.generateNames();
+mod.applyNames();
+fs.writeFileSync('meshopt_simplifier.wat', mod.toText({foldExprs:false, debug:true}));
+mod.destroy();
+console.log('ok');

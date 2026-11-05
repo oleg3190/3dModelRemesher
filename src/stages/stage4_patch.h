@@ -18,9 +18,9 @@ struct PatchBoundaryEdge {
 
 struct QuasiQuadPatch {
     uint32_t patch_id = 0;
-    std::array<uint32_t, 4> boundary_edges; // indices into PatchGraph::edges
-    std::array<bool, 4> edge_orientations;  // true if edge matches CCW loop
-    std::array<uint32_t, 4> corners;        // 4 corner vertices
+    std::array<uint32_t, 4> boundary_edges{INVALID_INDEX, INVALID_INDEX, INVALID_INDEX, INVALID_INDEX}; // indices into PatchGraph::edges
+    std::array<bool, 4> edge_orientations{false, false, false, false};  // true if edge matches CCW loop
+    std::array<uint32_t, 4> corners{INVALID_INDEX, INVALID_INDEX, INVALID_INDEX, INVALID_INDEX};  // 4 corner vertices
     int nu = 1;                             // subdivisions along u
     int nv = 1;                             // subdivisions along v
     uint16_t material_id = 0;
