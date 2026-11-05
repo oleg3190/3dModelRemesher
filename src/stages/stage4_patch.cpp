@@ -282,6 +282,18 @@ void Stage4PatchGraph::build_quasi_quad_patches(
     std::vector<int> patch_remap(total_patches);
     for (int p = 0; p < total_patches; ++p) patch_remap[p] = p;
 
+    // Cycle-safe representative lookup. patch_remap is written *while* we iterate, so a naive
+    // "follow until self" walk can end up in a p -> q -> p cycle and spin forever.
+    auto remap_root = [&patch_remap](int start) {
+        if (start < 0 || start >= static_cast<int>(patch_remap.size())) return start;
+        int root = start;
+        int guard = 0;
+        while (patch_remap[root] != root && guard++ < static_cast<int>(patch_remap.size())) {
+            root = patch_remap[root];
+        }
+        return root;
+    };
+
     for (int p = 0; p < total_patches; ++p) {
         if (patch_areas[p] < min_area_thresh) {
             // Find best neighbor
@@ -295,7 +307,9 @@ void Stage4PatchGraph::build_quasi_quad_patches(
                     if (tw != INVALID_INDEX) {
                         uint32_t adj_f = mesh.halfedges[tw].face;
                         if (adj_f != INVALID_INDEX && mesh.is_valid_face(adj_f)) {
-                            int adj_p = patch_remap[face_patch[adj_f]];
+                            int fp = face_patch[adj_f];
+                            if (fp < 0) continue;
+                            int adj_p = remap_root(fp);
                             if (adj_p != p) {
                                 uint32_t e = mesh.halfedges[h].edge;
                                 if (!mesh.edges[e].is_sharp && !mesh.edges[e].is_seam) {
@@ -312,7 +326,7 @@ void Stage4PatchGraph::build_quasi_quad_patches(
             }
 
             if (best_adj >= 0) {
-                patch_remap[p] = best_adj;
+                patch_remap[p] = remap_root(best_adj);
             }
         }
     }
@@ -321,8 +335,7 @@ void Stage4PatchGraph::build_quasi_quad_patches(
     std::vector<int> final_remap(total_patches, -1);
     int active_patch_count = 0;
     for (int p = 0; p < total_patches; ++p) {
-        int root = p;
-        while (patch_remap[root] != root) root = patch_remap[root];
+        int root = remap_root(p);
         if (final_remap[root] < 0) {
             final_remap[root] = active_patch_count++;
         }
@@ -430,8 +443,10 @@ void Stage4PatchGraph::build_quasi_quad_patches(
 
             uint32_t prev_v = junc;
             uint32_t curr_v = nbr;
+            size_t walk_guard = 0;
 
-            while (!is_junction[curr_v]) {
+            // Guard against cut cycles that contain no junction (would otherwise never terminate)
+            while (!is_junction[curr_v] && ++walk_guard <= mesh.vertices.size()) {
                 uint32_t next_v = INVALID_INDEX;
                 for (uint32_t cand : cut_nbrs[curr_v]) {
                     if (cand != prev_v) {
@@ -551,6 +566,7 @@ void Stage4PatchGraph::build_quasi_quad_patches(
     }
 
     // For each patch, find boundary halfedges whose twin is not in the same patch
+    size_t loops_missing = 0, path_lookup_miss = 0, border_steps = 0;
     for (int p = 0; p < active_patch_count; ++p) {
         std::unordered_set<uint32_t> p_faces(patches[p].member_faces.begin(), patches[p].member_faces.end());
         std::unordered_map<uint32_t, uint32_t> next_v_on_border;
@@ -583,7 +599,8 @@ void Stage4PatchGraph::build_quasi_quad_patches(
         std::unordered_set<uint32_t> visited_border;
 
         while (visited_border.size() < next_v_on_border.size()) {
-            visited_border.insert(curr);
+            // Revisiting an already-seen vertex without closing the loop: stop instead of spinning
+            if (!visited_border.insert(curr).second) break;
             if (is_junction[curr]) junction_cycle.push_back(curr);
 
             auto it = next_v_on_border.find(curr);
@@ -597,13 +614,26 @@ void Stage4PatchGraph::build_quasi_quad_patches(
             for (size_t i = 0; i < junction_cycle.size(); ++i) {
                 uint32_t u = junction_cycle[i];
                 uint32_t v = junction_cycle[(i + 1) % junction_cycle.size()];
+                border_steps++;
                 auto it = directed_edge_to_path.find({u, v});
                 if (it != directed_edge_to_path.end()) {
                     patches[p].boundary_loop.push_back(it->second);
+                } else {
+                    path_lookup_miss++;
                 }
             }
+        } else {
+            loops_missing++;
         }
     }
+
+    std::cout << "[stage4] junctions=" << junctions.size()
+              << " canonical_paths=" << paths.size()
+              << " patches=" << active_patch_count
+              << " patches_without_loop=" << loops_missing
+              << " path_lookup_miss=" << path_lookup_miss
+              << " border_steps=" << border_steps
+              << std::endl;
 
     out_graph.edge_paths = std::move(paths);
     out_graph.patches = std::move(patches);

@@ -8,6 +8,22 @@
 
 namespace qremesh {
 
+namespace {
+// Diagnostic counters for one extraction pass (single-threaded call order)
+struct ExtractStats {
+    size_t used_loop = 0;
+    size_t used_fallback = 0;
+    size_t skipped_tiny_loop = 0;   // N < 4 after collecting loop samples
+    size_t sum_border_verts = 0;
+    size_t sum_interior_verts = 0;
+    size_t sum_quads = 0;
+    size_t sum_nu = 0;
+    size_t sum_nv = 0;
+    void reset() { *this = ExtractStats{}; }
+};
+ExtractStats g_extract_stats;
+} // namespace
+
 void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     RemeshContext& ctx,
     PatchGraph& graph
@@ -157,6 +173,7 @@ void Stage5ParamAndExtract::extract_patch_quads(
     // 1. Collect full ordered boundary vertex sequence from canonical paths
     std::vector<uint32_t> bnd_out_verts;
     std::vector<Vec3f> bnd_positions;
+    bool used_fallback_branch = false;
 
     if (!patch.boundary_loop.empty()) {
         for (const auto& eref : patch.boundary_loop) {
@@ -194,6 +211,7 @@ void Stage5ParamAndExtract::extract_patch_quads(
         }
 
         if (!bnd_next.empty()) {
+            used_fallback_branch = true;
             bnd_out_verts.clear();
             bnd_positions.clear();
             uint32_t curr = bnd_next.begin()->first;
@@ -214,7 +232,13 @@ void Stage5ParamAndExtract::extract_patch_quads(
     }
 
     size_t N = bnd_out_verts.size();
-    if (N < 4) return;
+    if (N < 4) {
+        g_extract_stats.skipped_tiny_loop++;
+        return;
+    }
+    if (used_fallback_branch) g_extract_stats.used_fallback++;
+    else g_extract_stats.used_loop++;
+    g_extract_stats.sum_border_verts += N;
 
     // Ensure total perimeter is even
     if (N % 2 != 0) {
@@ -265,6 +289,8 @@ void Stage5ParamAndExtract::extract_patch_quads(
     int K = static_cast<int>(N / 2);
     int nu = std::max(1, K / 2);
     int nv = std::max(1, K - nu);
+    g_extract_stats.sum_nu += static_cast<size_t>(nu);
+    g_extract_stats.sum_nv += static_cast<size_t>(nv);
 
     // 4 corners on boundary loop
     size_t i0 = 0;
@@ -337,6 +363,9 @@ void Stage5ParamAndExtract::extract_patch_quads(
     }
 
     // Assemble quads with winding aligned with patch.avg_normal
+    g_extract_stats.sum_interior_verts += static_cast<size_t>(std::max(0, nu - 1)) *
+                                           static_cast<size_t>(std::max(0, nv - 1));
+    g_extract_stats.sum_quads += static_cast<size_t>(nu) * static_cast<size_t>(nv);
     for (int i = 0; i < nu; ++i) {
         for (int j = 0; j < nv; ++j) {
             uint32_t v0 = grid[i][j];
@@ -605,15 +634,90 @@ QrmStatus Stage5ParamAndExtract::execute(
     }
 
     // 3. Extract quads for each patch
-    for (const auto& patch : graph.patches) {
-        extract_patch_quads(ctx, patch, graph, out_quads);
+    g_extract_stats.reset();
+    {
+        size_t total_samples = 0, big_m = 0, max_m = 0;
+        for (const auto& ep : graph.edge_paths) {
+            total_samples += static_cast<size_t>(ep.integer_divisions) + 1;
+            if (ep.integer_divisions > 50) big_m++;
+            max_m = std::max(max_m, static_cast<size_t>(ep.integer_divisions));
+        }
+        std::vector<bool> used_path(graph.edge_paths.size(), false);
+        size_t used_paths = 0, samples_of_used = 0, sum_div_used = 0;
+        for (const auto& patch : graph.patches) {
+            for (const auto& eref : patch.boundary_loop) {
+                if (eref.edge_path_id < used_path.size()) used_path[eref.edge_path_id] = true;
+            }
+        }
+        for (size_t i = 0; i < used_path.size(); ++i) {
+            if (used_path[i]) {
+                used_paths++;
+                samples_of_used += static_cast<size_t>(graph.edge_paths[i].integer_divisions) + 1;
+                sum_div_used += static_cast<size_t>(graph.edge_paths[i].integer_divisions);
+            }
+        }
+        std::cout << "[stage5/paths] all_paths=" << graph.edge_paths.size()
+                  << " samples_all=" << total_samples
+                  << " max_div=" << max_m
+                  << " paths_div_gt50=" << big_m
+                  << " | used_by_loops=" << used_paths
+                  << " samples_used=" << samples_of_used
+                  << " sum_div_used=" << sum_div_used
+                  << std::endl;
     }
+    size_t empty_loops = 0, short_loops = 0, loop_paths_total = 0, quads_from_loops = 0;
+    for (const auto& patch : graph.patches) {
+        if (patch.boundary_loop.empty()) empty_loops++;
+        else if (patch.boundary_loop.size() < 4) short_loops++;
+        loop_paths_total += patch.boundary_loop.size();
+    }
+
+    for (const auto& patch : graph.patches) {
+        size_t before = out_quads.polygons.size();
+        extract_patch_quads(ctx, patch, graph, out_quads);
+        quads_from_loops += out_quads.polygons.size() - before;
+    }
+
+    size_t polys_before_weld = out_quads.polygons.size();
+    size_t verts_before_weld = out_quads.positions.size();
+    std::cout << "[stage5/extract] used_loop=" << g_extract_stats.used_loop
+              << " used_fallback=" << g_extract_stats.used_fallback
+              << " skipped_tiny=" << g_extract_stats.skipped_tiny_loop
+              << " sum_border=" << g_extract_stats.sum_border_verts
+              << " sum_interior=" << g_extract_stats.sum_interior_verts
+              << " sum_quads=" << g_extract_stats.sum_quads
+              << " avg_nu=" << (graph.patches.empty() ? 0.0 : static_cast<double>(g_extract_stats.sum_nu) / graph.patches.size())
+              << " avg_nv=" << (graph.patches.empty() ? 0.0 : static_cast<double>(g_extract_stats.sum_nv) / graph.patches.size())
+              << std::endl;
 
     if (out_quads.polygons.empty()) {
         return QRM_ERR_PARAM_FAILED;
     }
 
     weld_and_inherit_attributes(ctx, out_quads);
+
+    uint32_t referenced = 0;
+    {
+        std::vector<bool> seen(out_quads.positions.size(), false);
+        for (const auto& poly : out_quads.polygons) {
+            for (uint32_t v : poly) if (v < seen.size()) seen[v] = true;
+        }
+        for (bool b : seen) if (b) referenced++;
+    }
+    std::cout << "[stage5] patches=" << graph.patches.size()
+              << " edge_paths=" << graph.edge_paths.size()
+              << " empty_loops=" << empty_loops
+              << " loops_lt4=" << short_loops
+              << " avg_loop_paths="
+              << (graph.patches.empty() ? 0.0 : static_cast<double>(loop_paths_total) / graph.patches.size())
+              << "\n[stage5] grid_verts=" << verts_before_weld
+              << " verts_after_weld=" << out_quads.positions.size()
+              << " referenced=" << referenced
+              << " orphans=" << (out_quads.positions.size() - referenced)
+              << " polys_before_weld=" << polys_before_weld
+              << " polys_after_weld=" << out_quads.polygons.size()
+              << " loop_quads=" << quads_from_loops
+              << std::endl;
 
     ctx.dump_quads_obj("stage5_extracted", out_quads);
     return QRM_OK;

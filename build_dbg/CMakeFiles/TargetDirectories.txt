@@ -1,0 +1,5 @@
+/home/s/my/APPS/llama/flux/3dModelRemesher/build_dbg/CMakeFiles/qremesh_core.dir
+/home/s/my/APPS/llama/flux/3dModelRemesher/build_dbg/CMakeFiles/qremesh_core_static.dir
+/home/s/my/APPS/llama/flux/3dModelRemesher/build_dbg/CMakeFiles/qremesh_cli.dir
+/home/s/my/APPS/llama/flux/3dModelRemesher/build_dbg/CMakeFiles/edit_cache.dir
+/home/s/my/APPS/llama/flux/3dModelRemesher/build_dbg/CMakeFiles/rebuild_cache.dir

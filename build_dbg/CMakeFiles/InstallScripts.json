@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/s/my/APPS/llama/flux/3dModelRemesher/build_dbg/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
