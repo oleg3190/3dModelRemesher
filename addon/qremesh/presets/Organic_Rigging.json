@@ -1,0 +1,15 @@
+{
+    "name": "Organic & Rigging",
+    "target_quad_count": 8000,
+    "adaptive_density": 0.65,
+    "preserve_sharp_edges": false,
+    "sharp_angle_threshold": 60.0,
+    "preserve_uv_seams": true,
+    "preserve_material_borders": true,
+    "preserve_open_borders": true,
+    "enforce_closed_loops": true,
+    "exact_quad_count": false,
+    "allow_triangles": false,
+    "vertex_relax_iters": 25,
+    "auto_transfer_uv": true
+}

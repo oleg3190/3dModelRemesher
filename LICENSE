@@ -1,0 +1,11 @@
+# LICENSING INFORMATION
+
+This project uses a dual-license architecture:
+
+1. **qremesh Core Native Library (C++ / C ABI)**
+   - Licensed under the **Mozilla Public License, v. 2.0 (MPL-2.0)**.
+   - You may obtain a copy of the MPL-2.0 license at: https://www.mozilla.org/MPL/2.0/
+
+2. **QRemesh Blender Add-on (Python Integration & UI)**
+   - Licensed under the **GNU General Public License, v. 3.0 or later (GPL-3.0-or-later)** in accordance with Blender Extension standards.
+   - You may obtain a copy of the GPL-3.0 license at: https://www.gnu.org/licenses/gpl-3.0.html

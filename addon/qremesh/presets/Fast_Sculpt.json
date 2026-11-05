@@ -1,0 +1,15 @@
+{
+    "name": "Fast Sculpt Preview",
+    "target_quad_count": 3000,
+    "adaptive_density": 0.20,
+    "preserve_sharp_edges": false,
+    "sharp_angle_threshold": 45.0,
+    "preserve_uv_seams": false,
+    "preserve_material_borders": false,
+    "preserve_open_borders": false,
+    "enforce_closed_loops": false,
+    "exact_quad_count": false,
+    "allow_triangles": true,
+    "vertex_relax_iters": 10,
+    "auto_transfer_uv": false
+}
