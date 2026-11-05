@@ -87,6 +87,7 @@ typedef struct QrmQualityReport {
     float    scaled_jacobian_min;    // Минимальный якобиан (-1..1, норма > 0.2)
     float    scaled_jacobian_median; // Медианный якобиан (норма > 0.80)
     float    max_warp_angle_deg;     // Макс. угол излома непланарного квада (в градусах)
+    float    stage_times_sec[7];     // Время выполнения по стадиям 0..6
     float    total_time_sec;
 } QrmQualityReport;
 

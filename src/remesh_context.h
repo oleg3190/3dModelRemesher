@@ -32,6 +32,7 @@ public:
 
     // Timing
     std::chrono::high_resolution_clock::time_point start_time;
+    float stage_times[7] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     // Working structures
     BVHTree original_bvh;

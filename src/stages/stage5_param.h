@@ -22,6 +22,7 @@ private:
     static void extract_patch_quads(
         const RemeshContext& ctx,
         const QuasiQuadPatch& patch,
+        PatchGraph& graph,
         QuadMeshResult& out_quads
     );
 

@@ -158,6 +158,19 @@ int main(int argc, char** argv) {
     std::cout << "Max Warp Angle: " << mesh_out->report.max_warp_angle_deg << " deg" << std::endl;
     std::cout << "RMS Deviation: " << mesh_out->report.rms_deviation_rel << "%" << std::endl;
     std::cout << "Hausdorff Max: " << mesh_out->report.hausdorff_max_rel << "%" << std::endl;
+    std::cout << "--- Stage Timings ---" << std::endl;
+    const char* stage_names[] = {
+        "Stage 0 (Prep)",
+        "Stage 1 (Feature Cut)",
+        "Stage 2 (Sizing Field)",
+        "Stage 3 (Cross Field)",
+        "Stage 4 (Patch Graph)",
+        "Stage 5 (Param & Extract)",
+        "Stage 6 (Relax & Opt)"
+    };
+    for (int i = 0; i < 7; ++i) {
+        std::cout << "  " << stage_names[i] << ": " << mesh_out->report.stage_times_sec[i] << " s" << std::endl;
+    }
     std::cout << "Total Time: " << mesh_out->report.total_time_sec << " s" << std::endl;
     print_topology_stats(mesh_out);
 

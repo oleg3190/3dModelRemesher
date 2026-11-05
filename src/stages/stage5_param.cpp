@@ -1,7 +1,9 @@
 #include "stages/stage5_param.h"
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <cmath>
+#include <algorithm>
 #include <iostream>
 
 namespace qremesh {
@@ -10,60 +12,134 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     RemeshContext& ctx,
     PatchGraph& graph
 ) {
-    if (ctx.params->target_quad_count <= 0) return;
+    if (graph.edge_paths.empty() || graph.patches.empty()) return;
 
     int64_t target = ctx.params->target_quad_count;
-    int64_t current_total = 0;
-    for (const auto& p : graph.patches) {
-        current_total += static_cast<int64_t>(p.nu) * p.nv;
+    if (target <= 0) {
+        // Use target edge length
+        float h = (ctx.params->target_edge_length > 0.0f) ? ctx.params->target_edge_length : ctx.base_target_length;
+        for (auto& path : graph.edge_paths) {
+            int segs = static_cast<int>(std::round(path.continuous_len / h));
+            if (segs % 2 != 0) segs++;
+            path.integer_divisions = std::max(2, segs);
+        }
+        return;
     }
 
-    if (current_total == 0) return;
-
-    // Rescale proportionally
-    double ratio = std::sqrt(static_cast<double>(target) / static_cast<double>(current_total));
-    current_total = 0;
-    for (auto& p : graph.patches) {
-        p.nu = std::max(1, static_cast<int>(std::round(p.nu * ratio)));
-        p.nv = std::max(1, static_cast<int>(std::round(p.nv * ratio)));
-        current_total += static_cast<int64_t>(p.nu) * p.nv;
+    // Account for symmetry doubling if symmetry axis is active
+    double effective_target = static_cast<double>(target);
+    if (ctx.active_symmetry_axis >= 0 && ctx.active_symmetry_axis <= 2) {
+        effective_target *= 0.5;
     }
 
-    // Exact adjustment if requested
-    if (ctx.params->exact_quad_count) {
-        int guard = 0;
-        while (current_total != target && guard++ < 2000) {
-            int64_t diff = target - current_total;
-            if (diff > 0) {
-                // Add quad to largest patch
-                size_t best_p = 0;
-                int max_dim = 0;
-                for (size_t i = 0; i < graph.patches.size(); ++i) {
-                    if (graph.patches[i].nu * graph.patches[i].nv > max_dim) {
-                        max_dim = graph.patches[i].nu * graph.patches[i].nv;
-                        best_p = i;
-                    }
+    // Function to calculate total quads given global step size h
+    auto evaluate_total_quads = [&](float h) -> std::pair<int64_t, std::vector<int>> {
+        std::vector<int> path_divs(graph.edge_paths.size());
+        for (size_t i = 0; i < graph.edge_paths.size(); ++i) {
+            int segs = static_cast<int>(std::round(graph.edge_paths[i].continuous_len / h));
+            if (segs % 2 != 0) segs++;
+            path_divs[i] = std::max(2, segs);
+        }
+
+        int64_t total_quads = 0;
+        for (const auto& patch : graph.patches) {
+            int64_t perim_samples = 0;
+            if (!patch.boundary_loop.empty()) {
+                for (const auto& eref : patch.boundary_loop) {
+                    perim_samples += path_divs[eref.edge_path_id];
                 }
-                if (graph.patches[best_p].nu <= graph.patches[best_p].nv) graph.patches[best_p].nu++;
-                else graph.patches[best_p].nv++;
-                current_total = 0;
-                for (const auto& p : graph.patches) current_total += static_cast<int64_t>(p.nu) * p.nv;
             } else {
-                // Remove quad from largest patch
+                // Approximate from patch area
+                float side = std::sqrt(std::max(1e-6f, patch.member_faces.empty() ? 0.0f : 1.0f));
+                perim_samples = 4 * std::max(2, 2 * static_cast<int>(std::round(side / (2.0f * h))));
+            }
+
+            int K = static_cast<int>(perim_samples / 2);
+            int nu = std::max(1, K / 2);
+            int nv = std::max(1, K - nu);
+            total_quads += static_cast<int64_t>(nu) * nv;
+        }
+
+        return { total_quads, path_divs };
+    };
+
+    // Binary search for optimal h
+    float h_low = 0.001f * ctx.bbox_diag;
+    float h_high = 0.5f * ctx.bbox_diag;
+
+    std::vector<int> best_divs;
+    int64_t best_diff = std::numeric_limits<int64_t>::max();
+
+    for (int iter = 0; iter < 25; ++iter) {
+        float h_mid = 0.5f * (h_low + h_high);
+        auto [q_count, divs] = evaluate_total_quads(h_mid);
+
+        int64_t diff = std::abs(q_count - static_cast<int64_t>(effective_target));
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_divs = divs;
+        }
+
+        if (q_count > effective_target) {
+            h_low = h_mid; // need larger h to reduce quad count
+        } else {
+            h_high = h_mid; // need smaller h to increase quad count
+        }
+    }
+
+    if (!best_divs.empty()) {
+        for (size_t i = 0; i < graph.edge_paths.size(); ++i) {
+            graph.edge_paths[i].integer_divisions = best_divs[i];
+        }
+    }
+
+    // Exact quad count adjustment if requested
+    if (ctx.params->exact_quad_count) {
+        // Fine tune by adjusting divisions by +/- 2 on largest paths
+        auto get_current_quads = [&]() -> int64_t {
+            int64_t total = 0;
+            for (const auto& patch : graph.patches) {
+                int64_t perim = 0;
+                for (const auto& eref : patch.boundary_loop) {
+                    perim += graph.edge_paths[eref.edge_path_id].integer_divisions;
+                }
+                int K = std::max(2, static_cast<int>(perim / 2));
+                int nu = std::max(1, K / 2);
+                int nv = std::max(1, K - nu);
+                total += static_cast<int64_t>(nu) * nv;
+            }
+            return total;
+        };
+
+        int guard = 0;
+        while (guard++ < 200) {
+            int64_t curr = get_current_quads();
+            int64_t diff = static_cast<int64_t>(effective_target) - curr;
+            if (std::abs(diff) <= 2) break;
+
+            if (diff > 0) {
+                // Add 2 to the longest path
                 size_t best_p = 0;
-                int max_dim = 0;
-                for (size_t i = 0; i < graph.patches.size(); ++i) {
-                    if (graph.patches[i].nu > 1 && graph.patches[i].nv > 1 &&
-                        graph.patches[i].nu * graph.patches[i].nv > max_dim) {
-                        max_dim = graph.patches[i].nu * graph.patches[i].nv;
+                float max_l = 0.0f;
+                for (size_t i = 0; i < graph.edge_paths.size(); ++i) {
+                    if (graph.edge_paths[i].continuous_len > max_l) {
+                        max_l = graph.edge_paths[i].continuous_len;
                         best_p = i;
                     }
                 }
-                if (max_dim == 0) break;
-                if (graph.patches[best_p].nu >= graph.patches[best_p].nv) graph.patches[best_p].nu--;
-                else graph.patches[best_p].nv--;
-                current_total = 0;
-                for (const auto& p : graph.patches) current_total += static_cast<int64_t>(p.nu) * p.nv;
+                graph.edge_paths[best_p].integer_divisions += 2;
+            } else {
+                // Subtract 2 from longest path with divs > 2
+                size_t best_p = 0;
+                float max_l = 0.0f;
+                for (size_t i = 0; i < graph.edge_paths.size(); ++i) {
+                    if (graph.edge_paths[i].integer_divisions > 2 && graph.edge_paths[i].continuous_len > max_l) {
+                        max_l = graph.edge_paths[i].continuous_len;
+                        best_p = i;
+                    }
+                }
+                if (max_l == 0.0f) break;
+                graph.edge_paths[best_p].integer_divisions -= 2;
             }
         }
     }
@@ -72,46 +148,84 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
 void Stage5ParamAndExtract::extract_patch_quads(
     const RemeshContext& ctx,
     const QuasiQuadPatch& patch,
+    PatchGraph& graph,
     QuadMeshResult& out_quads
 ) {
     const auto& mesh = ctx.working_mesh;
     if (patch.member_faces.empty()) return;
 
-    std::unordered_set<uint32_t> patch_face_set(patch.member_faces.begin(), patch.member_faces.end());
+    // 1. Collect full ordered boundary vertex sequence from canonical paths
+    std::vector<uint32_t> bnd_out_verts;
+    std::vector<Vec3f> bnd_positions;
 
-    // Find boundary halfedges of this patch (halfedges whose twin is not in patch)
-    std::unordered_map<uint32_t, uint32_t> bnd_next;
-    for (uint32_t f : patch.member_faces) {
-        for (uint32_t h : mesh.get_face_halfedges(f)) {
-            uint32_t tw = mesh.halfedges[h].twin;
-            if (tw == INVALID_INDEX || !patch_face_set.count(mesh.halfedges[tw].face)) {
-                uint32_t u = mesh.from_vertex(h);
-                uint32_t v = mesh.halfedges[h].to_vertex;
-                bnd_next[u] = v;
+    if (!patch.boundary_loop.empty()) {
+        for (const auto& eref : patch.boundary_loop) {
+            const auto& ep = graph.edge_paths[eref.edge_path_id];
+            const auto& samples = ep.out_sample_vertices;
+            size_t n_samp = samples.size();
+            if (n_samp < 2) continue;
+
+            if (eref.forward) {
+                for (size_t i = 0; i + 1 < n_samp; ++i) {
+                    bnd_out_verts.push_back(samples[i]);
+                    bnd_positions.push_back(out_quads.positions[samples[i]]);
+                }
+            } else {
+                for (size_t i = n_samp - 1; i > 0; --i) {
+                    bnd_out_verts.push_back(samples[i]);
+                    bnd_positions.push_back(out_quads.positions[samples[i]]);
+                }
             }
         }
     }
 
-    // Trace boundary loop
-    std::vector<uint32_t> bnd_loop;
-    if (!bnd_next.empty()) {
-        uint32_t start_v = bnd_next.begin()->first;
-        uint32_t curr = start_v;
-        std::unordered_set<uint32_t> visited_bnd;
-        while (visited_bnd.size() < bnd_next.size()) {
-            bnd_loop.push_back(curr);
-            visited_bnd.insert(curr);
-            auto it = bnd_next.find(curr);
-            if (it == bnd_next.end() || it->second == start_v || visited_bnd.count(it->second)) break;
-            curr = it->second;
+    // Fallback if boundary loop could not be traced as closed cycle
+    if (bnd_out_verts.size() < 4) {
+        // Collect boundary halfedges directly from patch member faces
+        std::unordered_set<uint32_t> patch_face_set(patch.member_faces.begin(), patch.member_faces.end());
+        std::map<uint32_t, uint32_t> bnd_next;
+        for (uint32_t f : patch.member_faces) {
+            for (uint32_t h : mesh.get_face_halfedges(f)) {
+                uint32_t tw = mesh.halfedges[h].twin;
+                if (tw == INVALID_INDEX || !patch_face_set.count(mesh.halfedges[tw].face)) {
+                    bnd_next[mesh.from_vertex(h)] = mesh.halfedges[h].to_vertex;
+                }
+            }
+        }
+
+        if (!bnd_next.empty()) {
+            bnd_out_verts.clear();
+            bnd_positions.clear();
+            uint32_t curr = bnd_next.begin()->first;
+            uint32_t start = curr;
+            std::unordered_set<uint32_t> vis;
+            while (vis.size() < bnd_next.size()) {
+                vis.insert(curr);
+                uint32_t v_idx = static_cast<uint32_t>(out_quads.positions.size());
+                out_quads.positions.push_back(mesh.vertices[curr].pos);
+                bnd_out_verts.push_back(v_idx);
+                bnd_positions.push_back(mesh.vertices[curr].pos);
+
+                auto it = bnd_next.find(curr);
+                if (it == bnd_next.end() || it->second == start || vis.count(it->second)) break;
+                curr = it->second;
+            }
         }
     }
 
-    int nu = std::max(1, patch.nu);
-    int nv = std::max(1, patch.nv);
-    std::vector<std::vector<uint32_t>> grid(nu + 1, std::vector<uint32_t>(nv + 1, INVALID_INDEX));
+    size_t N = bnd_out_verts.size();
+    if (N < 4) return;
 
-    // Build a patch-local BVH over patch.member_faces so interior points never snap to opposite thin walls
+    // Ensure total perimeter is even
+    if (N % 2 != 0) {
+        // Duplicate one position to make even
+        uint32_t last = bnd_out_verts.back();
+        bnd_out_verts.push_back(last);
+        bnd_positions.push_back(bnd_positions.back());
+        N++;
+    }
+
+    // Build a patch-local BVH over patch.member_faces for interior point projection
     BVHTree patch_bvh;
     std::vector<float> patch_pos;
     std::vector<uint32_t> patch_tris;
@@ -146,149 +260,83 @@ void Stage5ParamAndExtract::extract_patch_quads(
         static_cast<uint32_t>(patch_tris.size() / 3)
     );
 
-    // If boundary loop has >= 4 vertices, use arc-length Coons Transfinite Interpolation
-    if (bnd_loop.size() >= 4) {
-        size_t n_loop = bnd_loop.size();
+    // Divide perimeter N into 4 sides: side0, side1, side2, side3
+    // Half perimeter K = N / 2. Set nu = K / 2, nv = K - nu.
+    int K = static_cast<int>(N / 2);
+    int nu = std::max(1, K / 2);
+    int nv = std::max(1, K - nu);
 
-        // Precompute cumulative arc length along bnd_loop (closed loop of n_loop segments)
-        std::vector<float> cum_len(n_loop + 1, 0.0f);
-        for (size_t k = 0; k < n_loop; ++k) {
-            const Vec3f& pa = mesh.vertices[bnd_loop[k]].pos;
-            const Vec3f& pb = mesh.vertices[bnd_loop[(k + 1) % n_loop]].pos;
-            cum_len[k + 1] = cum_len[k] + (pb - pa).norm();
-        }
-        float total_perim = std::max(cum_len[n_loop], 1e-6f);
+    // 4 corners on boundary loop
+    size_t i0 = 0;
+    size_t i1 = nu;
+    size_t i2 = nu + nv;
+    size_t i3 = 2 * nu + nv;
 
-        // Find 4 corners along the loop at 0, 1/4, 2/4, 3/4 of total arc-length perimeter
-        size_t i0 = 0;
-        auto find_idx_at_arc = [&](float target_s, size_t min_idx) -> size_t {
-            size_t best = min_idx;
-            float best_diff = std::numeric_limits<float>::infinity();
-            for (size_t k = min_idx; k < n_loop; ++k) {
-                float d = std::abs(cum_len[k] - target_s);
-                if (d < best_diff) {
-                    best_diff = d;
-                    best = k;
-                }
-            }
-            return best;
-        };
+    // Helper for boundary point retrieval along the 4 edges
+    auto get_bottom = [&](int i) -> uint32_t { return bnd_out_verts[(i0 + i) % N]; };
+    auto get_right  = [&](int j) -> uint32_t { return bnd_out_verts[(i1 + j) % N]; };
+    auto get_top    = [&](int i) -> uint32_t { return bnd_out_verts[(i2 + (nu - i)) % N]; };
+    auto get_left   = [&](int j) -> uint32_t { return bnd_out_verts[(i3 + (nv - j)) % N]; };
 
-        size_t i1 = std::max<size_t>(1, find_idx_at_arc(0.25f * total_perim, 1));
-        size_t i2 = std::max<size_t>(i1 + 1, find_idx_at_arc(0.50f * total_perim, std::min(i1 + 1, n_loop - 1)));
-        size_t i3 = std::max<size_t>(i2 + 1, find_idx_at_arc(0.75f * total_perim, std::min(i2 + 1, n_loop - 1)));
-        if (i3 >= n_loop) i3 = n_loop - 1;
+    std::vector<std::vector<uint32_t>> grid(nu + 1, std::vector<uint32_t>(nv + 1, INVALID_INDEX));
 
-        // Arc-length parameterized sampling between start_idx and end_idx forward along bnd_loop
-        auto sample_curve_forward = [&](size_t start_idx, size_t end_idx, float t) -> Vec3f {
-            t = clampf(t, 0.0f, 1.0f);
-            size_t segs = (end_idx >= start_idx) ? (end_idx - start_idx) : (n_loop - start_idx + end_idx);
-            if (segs == 0) return mesh.vertices[bnd_loop[start_idx]].pos;
+    // Place boundary vertices onto grid edges
+    for (int i = 0; i <= nu; ++i) {
+        grid[i][0] = get_bottom(i);
+        grid[i][nv] = get_top(i);
+    }
+    for (int j = 0; j <= nv; ++j) {
+        grid[0][j] = get_left(j);
+        grid[nu][j] = get_right(j);
+    }
 
-            std::vector<float> seg_cum(segs + 1, 0.0f);
-            for (size_t s = 0; s < segs; ++s) {
-                const Vec3f& pa = mesh.vertices[bnd_loop[(start_idx + s) % n_loop]].pos;
-                const Vec3f& pb = mesh.vertices[bnd_loop[(start_idx + s + 1) % n_loop]].pos;
-                seg_cum[s + 1] = seg_cum[s] + (pb - pa).norm();
-            }
-            float seg_tot = seg_cum[segs];
-            if (seg_tot <= 1e-7f) return mesh.vertices[bnd_loop[start_idx]].pos;
+    Vec3f p00 = out_quads.positions[grid[0][0]];
+    Vec3f p10 = out_quads.positions[grid[nu][0]];
+    Vec3f p11 = out_quads.positions[grid[nu][nv]];
+    Vec3f p01 = out_quads.positions[grid[0][nv]];
 
-            float target_d = t * seg_tot;
-            auto it = std::lower_bound(seg_cum.begin(), seg_cum.end(), target_d);
-            size_t step = static_cast<size_t>(std::distance(seg_cum.begin(), it));
-            if (step > 0) step--;
-            if (step >= segs) step = segs - 1;
+    // Internal grid nodes via Coons Transfinite Interpolation
+    for (int i = 1; i < nu; ++i) {
+        float u = static_cast<float>(i) / static_cast<float>(nu);
+        const Vec3f& c0 = out_quads.positions[grid[i][0]];  // bottom
+        const Vec3f& c2 = out_quads.positions[grid[i][nv]]; // top
 
-            float seg_len = seg_cum[step + 1] - seg_cum[step];
-            float frac = (seg_len > 1e-7f) ? clampf((target_d - seg_cum[step]) / seg_len, 0.0f, 1.0f) : 0.0f;
+        for (int j = 1; j < nv; ++j) {
+            float v = static_cast<float>(j) / static_cast<float>(nv);
+            const Vec3f& c3 = out_quads.positions[grid[0][j]];  // left
+            const Vec3f& c1 = out_quads.positions[grid[nu][j]]; // right
 
-            size_t idx_a = (start_idx + step) % n_loop;
-            size_t idx_b = (start_idx + step + 1) % n_loop;
-            return (1.0f - frac) * mesh.vertices[bnd_loop[idx_a]].pos + frac * mesh.vertices[bnd_loop[idx_b]].pos;
-        };
+            Vec3f corner_bilinear = (1.0f - u) * (1.0f - v) * p00 +
+                                     u * (1.0f - v) * p10 +
+                                     u * v * p11 +
+                                     (1.0f - u) * v * p01;
 
-        Vec3f p00 = mesh.vertices[bnd_loop[i0]].pos; // (u=0, v=0)
-        Vec3f p10 = mesh.vertices[bnd_loop[i1]].pos; // (u=1, v=0)
-        Vec3f p11 = mesh.vertices[bnd_loop[i2]].pos; // (u=1, v=1)
-        Vec3f p01 = mesh.vertices[bnd_loop[i3]].pos; // (u=0, v=1)
+            Vec3f coons_pt = (1.0f - v) * c0 + v * c2 + (1.0f - u) * c3 + u * c1 - corner_bilinear;
+            Vec3f projected_p = coons_pt;
 
-        for (int i = 0; i <= nu; ++i) {
-            float u = static_cast<float>(i) / static_cast<float>(nu);
-            Vec3f c0 = sample_curve_forward(i0, i1, u); // bottom (v=0)
-            Vec3f c2 = sample_curve_forward(i2, i3, 1.0f - u); // top (v=1)
-
-            for (int j = 0; j <= nv; ++j) {
-                float v = static_cast<float>(j) / static_cast<float>(nv);
-                Vec3f c3 = sample_curve_forward(i3, i0, 1.0f - v); // left (u=0)
-                Vec3f c1 = sample_curve_forward(i1, i2, v); // right (u=1)
-
-                // Coons Transfinite Interpolation
-                Vec3f corner_bilinear = (1.0f - u) * (1.0f - v) * p00 +
-                                         u * (1.0f - v) * p10 +
-                                         u * v * p11 +
-                                         (1.0f - u) * v * p01;
-
-                Vec3f initial_p = (1.0f - v) * c0 + v * c2 + (1.0f - u) * c3 + u * c1 - corner_bilinear;
-                Vec3f projected_p = initial_p;
-
-                bool is_on_patch_border = (i == 0 || i == nu || j == 0 || j == nv);
-                if (!is_on_patch_border) {
-                    Vec3f patch_pt, patch_norm;
-                    float d2_patch;
-                    if (has_patch_bvh && patch_bvh.closest_point(initial_p, patch_pt, patch_norm, d2_patch)) {
-                        projected_p = patch_pt;
-                        // Refine onto original high-res BVH only if close and normal-compatible
-                        Vec3f orig_pt, orig_norm;
-                        float d2_orig;
-                        if (ctx.original_bvh.closest_point(patch_pt, orig_pt, orig_norm, d2_orig)) {
-                            if (d2_orig <= 0.25f * ctx.base_target_length * ctx.base_target_length &&
-                                orig_norm.dot(patch_norm) > 0.3f) {
-                                projected_p = orig_pt;
-                            }
-                        }
-                    } else if (ctx.original_bvh.closest_point(initial_p, patch_pt, patch_norm, d2_patch)) {
-                        projected_p = patch_pt;
+            Vec3f patch_pt, patch_norm;
+            float d2_patch;
+            if (has_patch_bvh && patch_bvh.closest_point(coons_pt, patch_pt, patch_norm, d2_patch)) {
+                projected_p = patch_pt;
+                Vec3f orig_pt, orig_norm;
+                float d2_orig;
+                if (ctx.original_bvh.closest_point(patch_pt, orig_pt, orig_norm, d2_orig)) {
+                    if (d2_orig <= 0.5f * ctx.base_target_length * ctx.base_target_length &&
+                        orig_norm.dot(patch_norm) > 0.25f) {
+                        projected_p = orig_pt;
                     }
                 }
-
-                uint32_t new_v_idx = static_cast<uint32_t>(out_quads.positions.size());
-                out_quads.positions.push_back(projected_p);
-                grid[i][j] = new_v_idx;
+            } else if (ctx.original_bvh.closest_point(coons_pt, patch_pt, patch_norm, d2_patch)) {
+                projected_p = patch_pt;
             }
-        }
-    } else {
-        // Fallback: tangent plane projection
-        Vec3f centroid = Vec3f::Zero();
-        for (uint32_t f : patch.member_faces) {
-            centroid += mesh.compute_face_centroid(f);
-        }
-        centroid /= static_cast<float>(patch.member_faces.size());
 
-        Vec3f d1 = ctx.cross_field_dir1[patch.member_faces[0]];
-        Vec3f d2 = ctx.cross_field_dir2[patch.member_faces[0]];
-        float side = std::sqrt(std::max(mesh.compute_face_area(patch.member_faces[0]), 1e-5f)) * static_cast<float>(nu);
-
-        for (int i = 0; i <= nu; ++i) {
-            float u_pos = (static_cast<float>(i) / static_cast<float>(nu) - 0.5f) * side;
-            for (int j = 0; j <= nv; ++j) {
-                float v_pos = (static_cast<float>(j) / static_cast<float>(nv) - 0.5f) * side;
-                Vec3f initial_p = centroid + u_pos * d1 + v_pos * d2;
-
-                Vec3f projected_p, norm;
-                float d2_dist;
-                if (!ctx.original_bvh.closest_point(initial_p, projected_p, norm, d2_dist)) {
-                    projected_p = initial_p;
-                }
-
-                uint32_t new_v_idx = static_cast<uint32_t>(out_quads.positions.size());
-                out_quads.positions.push_back(projected_p);
-                grid[i][j] = new_v_idx;
-            }
+            uint32_t new_v = static_cast<uint32_t>(out_quads.positions.size());
+            out_quads.positions.push_back(projected_p);
+            grid[i][j] = new_v;
         }
     }
 
-    // Assemble quads
+    // Assemble quads with winding aligned with patch.avg_normal
     for (int i = 0; i < nu; ++i) {
         for (int j = 0; j < nv; ++j) {
             uint32_t v0 = grid[i][j];
@@ -296,7 +344,18 @@ void Stage5ParamAndExtract::extract_patch_quads(
             uint32_t v2 = grid[i + 1][j + 1];
             uint32_t v3 = grid[i][j + 1];
 
-            out_quads.polygons.push_back({v0, v1, v2, v3});
+            const Vec3f& p0 = out_quads.positions[v0];
+            const Vec3f& p1 = out_quads.positions[v1];
+            const Vec3f& p2 = out_quads.positions[v2];
+            const Vec3f& p3 = out_quads.positions[v3];
+
+            Vec3f q_normal = (p2 - p0).cross(p3 - p1);
+            if (q_normal.dot(patch.avg_normal) < 0.0f) {
+                // Reverse winding to match patch orientation
+                out_quads.polygons.push_back({v0, v3, v2, v1});
+            } else {
+                out_quads.polygons.push_back({v0, v1, v2, v3});
+            }
             out_quads.material_ids.push_back(patch.material_id);
         }
     }
@@ -308,8 +367,8 @@ void Stage5ParamAndExtract::weld_and_inherit_attributes(
 ) {
     if (out_quads.positions.empty() || out_quads.polygons.empty()) return;
 
-    // Weld vertices across patch boundaries
-    float weld_tol = 0.15f * ctx.base_target_length;
+    // Conservative weld tolerance: strictly for true identical vertices
+    float weld_tol = 1e-5f * ctx.bbox_diag;
     float inv_cell = 1.0f / std::max(weld_tol, 1e-6f);
 
     std::unordered_map<int64_t, std::vector<uint32_t>> spatial_hash;
@@ -330,7 +389,6 @@ void Stage5ParamAndExtract::weld_and_inherit_attributes(
         uint32_t match = INVALID_INDEX;
         float best_d2 = weld_tol * weld_tol;
 
-        // Search 3x3x3 neighboring cells
         for (int64_t dx = -1; dx <= 1 && match == INVALID_INDEX; ++dx) {
             for (int64_t dy = -1; dy <= 1 && match == INVALID_INDEX; ++dy) {
                 for (int64_t dz = -1; dz <= 1; ++dz) {
@@ -360,7 +418,7 @@ void Stage5ParamAndExtract::weld_and_inherit_attributes(
 
     out_quads.positions = std::move(unique_pos);
 
-    // Remap polygon indices and filter degenerates created by welding
+    // Remap polygon indices
     std::vector<std::vector<uint32_t>> valid_polys;
     std::vector<uint16_t> valid_mats;
     valid_polys.reserve(out_quads.polygons.size());
@@ -372,7 +430,7 @@ void Stage5ParamAndExtract::weld_and_inherit_attributes(
             v = remap[v];
         }
 
-        // Remove consecutive duplicates (including wrap-around)
+        // Deduplicate consecutive
         std::vector<uint32_t> cleaned;
         cleaned.reserve(poly.size());
         for (size_t i = 0; i < poly.size(); ++i) {
@@ -383,7 +441,6 @@ void Stage5ParamAndExtract::weld_and_inherit_attributes(
             }
         }
 
-        // Check that all remaining vertices in polygon are distinct and count >= 3
         if (cleaned.size() >= 3) {
             bool all_distinct = true;
             for (size_t i = 0; i < cleaned.size() && all_distinct; ++i) {
@@ -404,14 +461,12 @@ void Stage5ParamAndExtract::weld_and_inherit_attributes(
     out_quads.polygons = std::move(valid_polys);
     out_quads.material_ids = std::move(valid_mats);
 
-    // Detect and inherit sharp / seam edges via Spatial Hash (O(1) per edge)
+    // Detect and inherit sharp / seam edges via Spatial Hash
     out_quads.sharp_edges.clear();
     out_quads.crease_values.clear();
     out_quads.seam_edges.clear();
 
     const auto& orig_mesh = ctx.working_mesh;
-
-    // Index only sharp and seam edges of working mesh into spatial grid
     float edge_cell_size = std::max(ctx.base_target_length, 1e-4f);
     float inv_edge_cell = 1.0f / edge_cell_size;
 
@@ -496,8 +551,62 @@ QrmStatus Stage5ParamAndExtract::execute(
     out_quads.polygons.clear();
     out_quads.material_ids.clear();
 
+    const auto& mesh = ctx.working_mesh;
+
+    // 1. Create global output vertices for all junctions (once, shared)
+    std::unordered_map<uint32_t, uint32_t> junc_to_out;
+    for (const auto& ep : graph.edge_paths) {
+        if (!junc_to_out.count(ep.node_start)) {
+            uint32_t out_idx = static_cast<uint32_t>(out_quads.positions.size());
+            out_quads.positions.push_back(mesh.vertices[ep.node_start].pos);
+            junc_to_out[ep.node_start] = out_idx;
+        }
+        if (!junc_to_out.count(ep.node_end)) {
+            uint32_t out_idx = static_cast<uint32_t>(out_quads.positions.size());
+            out_quads.positions.push_back(mesh.vertices[ep.node_end].pos);
+            junc_to_out[ep.node_end] = out_idx;
+        }
+    }
+
+    // 2. Canonical arc-length sampling for every path in graph.edge_paths
+    for (auto& ep : graph.edge_paths) {
+        int M = ep.integer_divisions;
+        ep.out_sample_vertices.resize(M + 1);
+        ep.out_sample_vertices[0] = junc_to_out[ep.node_start];
+        ep.out_sample_vertices[M] = junc_to_out[ep.node_end];
+
+        // Cumulative arc length along ep.path_vertices
+        size_t n_pv = ep.path_vertices.size();
+        std::vector<float> cum_len(n_pv, 0.0f);
+        for (size_t k = 0; k + 1 < n_pv; ++k) {
+            float d = (mesh.vertices[ep.path_vertices[k + 1]].pos - mesh.vertices[ep.path_vertices[k]].pos).norm();
+            cum_len[k + 1] = cum_len[k] + d;
+        }
+        float tot_l = std::max(cum_len.back(), 1e-6f);
+
+        for (int s = 1; s < M; ++s) {
+            float target_d = (static_cast<float>(s) / static_cast<float>(M)) * tot_l;
+            auto it = std::lower_bound(cum_len.begin(), cum_len.end(), target_d);
+            size_t idx = static_cast<size_t>(std::distance(cum_len.begin(), it));
+            if (idx == 0) idx = 1;
+            if (idx >= n_pv) idx = n_pv - 1;
+
+            float seg_l = cum_len[idx] - cum_len[idx - 1];
+            float frac = (seg_l > 1e-7f) ? (target_d - cum_len[idx - 1]) / seg_l : 0.0f;
+            frac = clampf(frac, 0.0f, 1.0f);
+
+            Vec3f pos = (1.0f - frac) * mesh.vertices[ep.path_vertices[idx - 1]].pos +
+                        frac * mesh.vertices[ep.path_vertices[idx]].pos;
+
+            uint32_t out_idx = static_cast<uint32_t>(out_quads.positions.size());
+            out_quads.positions.push_back(pos);
+            ep.out_sample_vertices[s] = out_idx;
+        }
+    }
+
+    // 3. Extract quads for each patch
     for (const auto& patch : graph.patches) {
-        extract_patch_quads(ctx, patch, out_quads);
+        extract_patch_quads(ctx, patch, graph, out_quads);
     }
 
     if (out_quads.polygons.empty()) {

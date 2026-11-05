@@ -200,6 +200,10 @@ void Stage6Optimize::tangential_taubin_smoothing(
         }
     }
 
+    for (uint32_t v = 0; v < nv; ++v) {
+        std::sort(sharp_nbrs[v].begin(), sharp_nbrs[v].end());
+    }
+
     constexpr float lambda = 0.33f;
     constexpr float mu = -0.34f;
     float max_dev = ctx.params->max_surface_deviation * 0.01f * ctx.bbox_diag;
@@ -451,31 +455,103 @@ void Stage6Optimize::compute_final_quality_report(
     }
     r.singularity_count = singularities;
 
-    // Hausdorff & RMS error relative to original BVH in parallel
-    tbb::combinable<float> max_dev_sq_comb(0.0f);
-    tbb::combinable<double> sum_dev_sq_comb(0.0);
+    // Hausdorff & RMS error computed with dense two-way sampling against original mesh
+    // 1. out -> src (samples on output mesh to ctx.original_bvh)
+    float max_out2src_sq = 0.0f;
+    double sum_out2src_sq = 0.0;
+    size_t out_samples_count = 0;
 
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, qmesh.positions.size()), [&](const tbb::blocked_range<size_t>& r_range) {
-        float local_max = max_dev_sq_comb.local();
-        double local_sum = sum_dev_sq_comb.local();
-        for (size_t i = r_range.begin(); i != r_range.end(); ++i) {
+    for (const auto& p : qmesh.positions) {
+        Vec3f cp, n;
+        float d2;
+        if (ctx.original_bvh.closest_point(p, cp, n, d2)) {
+            max_out2src_sq = std::max(max_out2src_sq, d2);
+            sum_out2src_sq += d2;
+            out_samples_count++;
+        }
+    }
+
+    for (const auto& poly : qmesh.polygons) {
+        if (poly.size() >= 3) {
+            Vec3f centroid = Vec3f::Zero();
+            for (uint32_t idx : poly) centroid += qmesh.positions[idx];
+            centroid /= static_cast<float>(poly.size());
+
             Vec3f cp, n;
             float d2;
-            if (ctx.original_bvh.closest_point(qmesh.positions[i], cp, n, d2)) {
-                local_max = std::max(local_max, d2);
-                local_sum += d2;
+            if (ctx.original_bvh.closest_point(centroid, cp, n, d2)) {
+                max_out2src_sq = std::max(max_out2src_sq, d2);
+                sum_out2src_sq += d2;
+                out_samples_count++;
             }
         }
-        max_dev_sq_comb.local() = local_max;
-        sum_dev_sq_comb.local() = local_sum;
-    });
+    }
 
-    float max_dev_sq = max_dev_sq_comb.combine([](float a, float b) { return std::max(a, b); });
-    double sum_dev_sq = sum_dev_sq_comb.combine([](double a, double b) { return a + b; });
+    // 2. src -> out (samples on original mesh to out_bvh)
+    BVHTree out_bvh;
+    std::vector<float> flat_out_pos;
+    flat_out_pos.reserve(qmesh.positions.size() * 3);
+    for (const auto& p : qmesh.positions) {
+        flat_out_pos.push_back(p.x());
+        flat_out_pos.push_back(p.y());
+        flat_out_pos.push_back(p.z());
+    }
+
+    std::vector<uint32_t> out_tri_indices;
+    for (const auto& poly : qmesh.polygons) {
+        if (poly.size() == 4) {
+            out_tri_indices.push_back(poly[0]);
+            out_tri_indices.push_back(poly[1]);
+            out_tri_indices.push_back(poly[2]);
+
+            out_tri_indices.push_back(poly[0]);
+            out_tri_indices.push_back(poly[2]);
+            out_tri_indices.push_back(poly[3]);
+        } else if (poly.size() >= 3) {
+            for (size_t k = 1; k + 1 < poly.size(); ++k) {
+                out_tri_indices.push_back(poly[0]);
+                out_tri_indices.push_back(poly[k]);
+                out_tri_indices.push_back(poly[k + 1]);
+            }
+        }
+    }
+
+    bool has_out_bvh = false;
+    if (!out_tri_indices.empty()) {
+        has_out_bvh = out_bvh.build(
+            flat_out_pos.data(),
+            static_cast<uint32_t>(qmesh.positions.size()),
+            out_tri_indices.data(),
+            static_cast<uint32_t>(out_tri_indices.size() / 3)
+        );
+    }
+
+    float max_src2out_sq = 0.0f;
+    double sum_src2out_sq = 0.0;
+    size_t src_samples_count = 0;
+
+    if (has_out_bvh) {
+        for (const auto& v : ctx.working_mesh.vertices) {
+            if (!v.is_deleted) {
+                Vec3f cp, n;
+                float d2;
+                if (out_bvh.closest_point(v.pos, cp, n, d2)) {
+                    max_src2out_sq = std::max(max_src2out_sq, d2);
+                    sum_src2out_sq += d2;
+                    src_samples_count++;
+                }
+            }
+        }
+    }
+
+    float max_dev_sq = std::max(max_out2src_sq, max_src2out_sq);
+    double rms_out2src = std::sqrt(sum_out2src_sq / std::max<size_t>(1, out_samples_count));
+    double rms_src2out = std::sqrt(sum_src2out_sq / std::max<size_t>(1, src_samples_count));
+    double chamfer_rms = 0.5 * (rms_out2src + rms_src2out);
 
     float diag = std::max(ctx.bbox_diag, 1e-4f);
     r.hausdorff_max_rel = (std::sqrt(max_dev_sq) / diag) * 100.0f;
-    r.rms_deviation_rel = (std::sqrt(sum_dev_sq / std::max(1.0, (double)nv)) / diag) * 100.0f;
+    r.rms_deviation_rel = static_cast<float>((chamfer_rms / diag) * 100.0);
 
     auto end_time = std::chrono::high_resolution_clock::now();
     r.total_time_sec = std::chrono::duration<float>(end_time - ctx.start_time).count();

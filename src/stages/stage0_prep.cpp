@@ -37,7 +37,7 @@ bool Stage0Prep::weld_vertices(
 
     for (uint32_t i = 0; i < in_nv; ++i) {
         Vec3f p(in_pos[3 * i + 0], in_pos[3 * i + 1], in_pos[3 * i + 2]);
-        if (std::isnan(p.x()) || std::isnan(p.y()) || std::isnan(p.z())) {
+        if (!std::isfinite(p.x()) || !std::isfinite(p.y()) || !std::isfinite(p.z())) {
             continue;
         }
 
@@ -493,10 +493,13 @@ QrmStatus Stage0Prep::execute(RemeshContext& ctx) {
     ctx.bbox = BoundingBox();
     for (uint32_t i = 0; i < in->nv; ++i) {
         Vec3f p(in->positions[3 * i + 0], in->positions[3 * i + 1], in->positions[3 * i + 2]);
-        if (std::isnan(p.x()) || std::isnan(p.y()) || std::isnan(p.z())) {
+        if (!std::isfinite(p.x()) || !std::isfinite(p.y()) || !std::isfinite(p.z())) {
             return QRM_ERR_INVALID_INPUT;
         }
         ctx.bbox.expand(p);
+    }
+    if (ctx.bbox.diagonal() <= 1e-7f) {
+        return QRM_ERR_INVALID_INPUT;
     }
     ctx.bbox_diag = std::max(ctx.bbox.diagonal(), 1e-4f);
 
@@ -532,7 +535,7 @@ QrmStatus Stage0Prep::execute(RemeshContext& ctx) {
     }
 
     // Step 2: Manifold repair & orient
-    if (!fix_manifold_and_orient(welded_pos, welded_tris, mat_ids)) {
+    if (!fix_manifold_and_orient(welded_pos, welded_tris, mat_ids) || welded_tris.size() < 12) {
         return QRM_ERR_TOPOLOGY_UNFIXABLE;
     }
 

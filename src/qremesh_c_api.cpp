@@ -58,37 +58,62 @@ QrmStatus qrm_remesh(
         return QRM_ERR_INVALID_INPUT;
     }
 
+    // Input validation: check indices and finite coordinates
+    for (uint32_t i = 0; i < in_mesh->nv * 3; ++i) {
+        float val = in_mesh->positions[i];
+        if (!std::isfinite(val)) {
+            return QRM_ERR_INVALID_INPUT;
+        }
+    }
+    for (uint32_t i = 0; i < in_mesh->nt * 3; ++i) {
+        if (in_mesh->tri_indices[i] >= in_mesh->nv) {
+            return QRM_ERR_INVALID_INPUT;
+        }
+    }
+
     try {
         qremesh::RemeshContext ctx(in_mesh, params, progress_cb, user_data);
 
+        auto time_stage = [&](int stage_idx, auto fn) -> QrmStatus {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            QrmStatus s = fn();
+            auto t1 = std::chrono::high_resolution_clock::now();
+            ctx.stage_times[stage_idx] = std::chrono::duration<float>(t1 - t0).count();
+            return s;
+        };
+
         // Stage 0: Normalization, Manifold Repair & QEM Proxy
-        QrmStatus status = qremesh::Stage0Prep::execute(ctx);
+        QrmStatus status = time_stage(0, [&]() { return qremesh::Stage0Prep::execute(ctx); });
         if (status != QRM_OK) return status;
 
         // Stage 1: Feature Cut & Boundary Embedding
-        status = qremesh::Stage1FeatureCut::execute(ctx);
+        status = time_stage(1, [&]() { return qremesh::Stage1FeatureCut::execute(ctx); });
         if (status != QRM_OK) return status;
 
         // Stage 2: Curvature & Sizing Field
-        status = qremesh::Stage2SizingField::execute(ctx);
+        status = time_stage(2, [&]() { return qremesh::Stage2SizingField::execute(ctx); });
         if (status != QRM_OK) return status;
 
         // Stage 3: 4-RoSy Cross Field & Singularities
-        status = qremesh::Stage3CrossField::execute(ctx);
+        status = time_stage(3, [&]() { return qremesh::Stage3CrossField::execute(ctx); });
         if (status != QRM_OK) return status;
 
         // Stage 4: Motorcycle Graph & Quasi-Quad Patches
         qremesh::PatchGraph graph;
-        status = qremesh::Stage4PatchGraph::execute(ctx, graph);
+        status = time_stage(4, [&]() { return qremesh::Stage4PatchGraph::execute(ctx, graph); });
         if (status != QRM_OK) return status;
 
         // Stage 5: Integer Parametrization & Quad Mesh Extraction
-        status = qremesh::Stage5ParamAndExtract::execute(ctx, graph, ctx.result);
+        status = time_stage(5, [&]() { return qremesh::Stage5ParamAndExtract::execute(ctx, graph, ctx.result); });
         if (status != QRM_OK) return status;
 
         // Stage 6: Topological Cleanup & Tangential Relaxation
-        status = qremesh::Stage6Optimize::execute(ctx, ctx.result);
+        status = time_stage(6, [&]() { return qremesh::Stage6Optimize::execute(ctx, ctx.result); });
         if (status != QRM_OK) return status;
+
+        for (int i = 0; i < 7; ++i) {
+            ctx.result.report.stage_times_sec[i] = ctx.stage_times[i];
+        }
 
         // Allocate and pack QrmMeshOut
         auto* out = static_cast<QrmMeshOut*>(std::calloc(1, sizeof(QrmMeshOut)));
