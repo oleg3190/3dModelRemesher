@@ -801,6 +801,66 @@ QrmStatus Stage0Prep::execute(RemeshContext& ctx) {
                   << " nonmanifold_edges=" << nm << std::endl;
     }
 
+    // T5 (S36): drop disconnected debris. The source AI mesh has 902 connected components -
+    // one main shell (98% of faces) plus hundreds of floating dust islands (<=20 faces). Each
+    // island that survives becomes an extra connected component in the OUTPUT (S35 caveat:
+    // 2-4 components at coarse/mid budgets). We keep components >= a size threshold (a
+    // fraction of the LARGEST component, floor 50 faces) so genuine multi-part meshes keep
+    // their real parts but dust vanishes. This runs before the BVH is built, so the reference
+    // surface matches the cleaned mesh. Env-gated: QREMESH_DROP_DEBRIS (ratio opt via
+    // QREMESH_DEBRIS_RATIO, default 0.02 of the largest component).
+    if (std::getenv("QREMESH_DROP_DEBRIS")) {
+        uint32_t nf = static_cast<uint32_t>(welded_tris.size() / 3);
+        // union-find over faces sharing an edge
+        std::vector<uint32_t> parent(nf);
+        for (uint32_t i = 0; i < nf; ++i) parent[i] = i;
+        auto find = [&](uint32_t x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+        auto uni = [&](uint32_t a, uint32_t b) { a = find(a); b = find(b); if (a != b) parent[a] = b; };
+        std::unordered_map<uint64_t, uint32_t> edge_first;
+        for (uint32_t f = 0; f < nf; ++f) {
+            uint32_t v[3] = { welded_tris[3*f], welded_tris[3*f+1], welded_tris[3*f+2] };
+            for (int i = 0; i < 3; ++i) {
+                uint32_t a = v[i], b = v[(i+1)%3];
+                uint64_t key = (uint64_t(std::min(a,b)) << 32) | std::max(a,b);
+                auto it = edge_first.find(key);
+                if (it == edge_first.end()) edge_first[key] = f;
+                else uni(it->second, f);
+            }
+        }
+        std::unordered_map<uint32_t, uint32_t> comp_size;
+        uint32_t largest = 0;
+        for (uint32_t f = 0; f < nf; ++f) {
+            uint32_t r = find(f);
+            uint32_t s = ++comp_size[r];
+            if (s > largest) largest = s;
+        }
+        float ratio = 0.02f;
+        if (const char* e = std::getenv("QREMESH_DEBRIS_RATIO")) {
+            float r = std::atof(e);
+            if (r > 0.0f) ratio = r;
+        }
+        uint32_t thresh = std::max<uint32_t>(50, static_cast<uint32_t>(ratio * largest));
+        std::vector<uint32_t> new_tris; new_tris.reserve(welded_tris.size());
+        std::vector<uint16_t> new_mats; new_mats.reserve(mat_ids.size());
+        uint32_t dropped_faces = 0, dropped_comps = 0;
+        for (uint32_t f = 0; f < nf; ++f) {
+            uint32_t r = find(f);
+            if (comp_size[r] >= thresh) {
+                new_tris.push_back(welded_tris[3*f]); new_tris.push_back(welded_tris[3*f+1]); new_tris.push_back(welded_tris[3*f+2]);
+                if (f < mat_ids.size()) new_mats.push_back(mat_ids[f]);
+            } else {
+                dropped_faces++;
+            }
+        }
+        for (const auto& cs : comp_size) if (cs.second < thresh) dropped_comps++;
+        welded_tris = std::move(new_tris);
+        mat_ids = std::move(new_mats);
+        std::cout << "[stage0/debris] kept_faces=" << welded_tris.size()/3
+                  << " dropped_faces=" << dropped_faces
+                  << " dropped_comps=" << dropped_comps
+                  << " thresh=" << thresh << " largest=" << largest << std::endl;
+    }
+
     // Step 3: Build reference BVH on original cleaned geometry
     std::vector<float> flat_pos;
     flat_pos.reserve(welded_pos.size() * 3);
