@@ -1160,7 +1160,7 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     };
     log_area("entry");
 
-    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 20); log_area("after_fill"); }
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 300); log_area("after_fill"); }
     cleanup_topology(qmesh);
     log_area("after_cleanup");
     tangential_taubin_smoothing(ctx, qmesh, relax_iters);
@@ -1168,6 +1168,8 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     cleanup_topology(qmesh);
     log_area("after_cleanup2");
     if (!skip_untangle) { untangle_low_jacobians(ctx, qmesh); log_area("after_untangle"); }
+    // Second fill pass: cleanup/untangle can open small holes after the first pass
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 300); log_area("after_fill2"); }
 
     // Final exact-position weld & manifold/degenerate face sanitizer
     {
@@ -1324,6 +1326,76 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     if (ctx.active_symmetry_axis >= 0 && ctx.active_symmetry_axis <= 2) {
         float tol = ctx.params->symmetry_tolerance * 0.01f * ctx.bbox_diag;
         mirror_symmetry(ctx, qmesh, ctx.active_symmetry_axis, tol);
+    }
+
+    // Final fill: the exact-position weld / degenerate-face sanitizer above can open
+    // holes again after the previous passes
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 300); log_area("after_fill3"); }
+
+    // Drop microscopic disconnected islands (closed shells below 0.5% of the largest
+    // shell's area): leftovers of tiny sliver patches that show up as stray components
+    // while carrying no visible geometry.
+    {
+        size_t np = qmesh.polygons.size();
+        if (np > 1) {
+            std::vector<uint32_t> parent(np);
+            for (size_t i = 0; i < np; ++i) parent[i] = static_cast<uint32_t>(i);
+            auto find = [&parent](uint32_t x) {
+                uint32_t r = x;
+                while (parent[r] != r) r = parent[r];
+                while (parent[x] != x) { uint32_t nx = parent[x]; parent[x] = r; x = nx; }
+                return r;
+            };
+            std::unordered_map<uint64_t, uint32_t> owner;
+            for (size_t pi = 0; pi < np; ++pi) {
+                const auto& p = qmesh.polygons[pi];
+                for (size_t k = 0; k < p.size(); ++k) {
+                    uint32_t a = p[k], b = p[(k + 1) % p.size()];
+                    if (a == b) continue;
+                    uint64_t key = (static_cast<uint64_t>(std::min(a, b)) << 32) | std::max(a, b);
+                    auto it = owner.find(key);
+                    if (it == owner.end()) {
+                        owner.emplace(key, static_cast<uint32_t>(pi));
+                    } else {
+                        uint32_t ra = find(it->second);
+                        uint32_t rb = find(static_cast<uint32_t>(pi));
+                        if (ra != rb) parent[rb] = ra;
+                    }
+                }
+            }
+            std::vector<double> comp_area(np, 0.0);
+            for (size_t pi = 0; pi < np; ++pi) {
+                const auto& p = qmesh.polygons[pi];
+                if (p.size() < 3) continue;
+                const Vec3f& a0 = qmesh.positions[p[0]];
+                for (size_t k = 1; k + 1 < p.size(); ++k) {
+                    Vec3f e1 = qmesh.positions[p[k]] - a0;
+                    Vec3f e2 = qmesh.positions[p[k + 1]] - a0;
+                    comp_area[find(static_cast<uint32_t>(pi))] += 0.5 * static_cast<double>(e1.cross(e2).norm());
+                }
+            }
+            double max_area = 0.0;
+            for (size_t pi = 0; pi < np; ++pi) {
+                double a = comp_area[find(static_cast<uint32_t>(pi))];
+                if (a > max_area) max_area = a;
+            }
+            std::vector<std::vector<uint32_t>> polys;
+            std::vector<uint16_t> mats;
+            polys.reserve(np);
+            mats.reserve(np);
+            for (size_t pi = 0; pi < np; ++pi) {
+                if (comp_area[find(static_cast<uint32_t>(pi))] >= 0.005 * max_area) {
+                    polys.push_back(qmesh.polygons[pi]);
+                    mats.push_back(pi < qmesh.material_ids.size() ? qmesh.material_ids[pi] : 0);
+                }
+            }
+            size_t dropped = np - polys.size();
+            if (dropped > 0 && dropped < np) {
+                qmesh.polygons = std::move(polys);
+                qmesh.material_ids = std::move(mats);
+                std::cout << "[stage6] micro_islands_dropped=" << dropped << std::endl;
+            }
+        }
     }
 
     compute_final_quality_report(ctx, qmesh);

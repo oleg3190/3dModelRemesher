@@ -1275,21 +1275,39 @@ void Stage4PatchGraph::build_quasi_quad_patches(
         }
     }
 
-    for (int p = 0; p < active_patch_count; ++p) {
-        if (patches[p].boundary_loop.empty()) continue;
-        if (active_patch_count > 1) {
-            bool shares_any = false;
-            for (const auto& eref : patches[p].boundary_loop) {
-                if (eref.edge_path_id < path_loop_uses.size() && path_loop_uses[eref.edge_path_id] >= 2) {
-                    shares_any = true;
-                    break;
+    {
+        // Diagnostic: a canonical path should normally appear in TWO patch loops (one per
+        // side). Paths used once are fine only when they lie on the model's open border;
+        // any other "used once" path means the neighbouring patch is missing it in its
+        // loop - the source of unstitched borders (holes).
+        size_t used_once = 0, used_once_not_open = 0, not_open_examples = 0;
+        for (size_t i = 0; i < paths.size() && i < path_loop_uses.size(); ++i) {
+            if (path_loop_uses[i] <= 1) {
+                used_once++;
+                if (!paths[i].is_open_border) {
+                    used_once_not_open++;
+                    if (not_open_examples < 5) {
+                        std::cout << "    [stage4/unshared] path " << i
+                                  << " len=" << paths[i].continuous_len
+                                  << " loop_uses=" << path_loop_uses[i]
+                                  << " verts=" << paths[i].path_vertices.size() << std::endl;
+                        not_open_examples++;
+                    }
                 }
             }
-            if (!shares_any && patches[p].boundary_loop.size() < 4) {
-                patches[p].boundary_loop.clear();
-                continue;
-            }
         }
+        std::cout << "[stage4] paths_used_once=" << used_once
+                  << " not_open_border=" << used_once_not_open
+                  << " (of " << paths.size() << ")" << std::endl;
+    }
+
+    for (int p = 0; p < active_patch_count; ++p) {
+        if (patches[p].boundary_loop.empty()) continue;
+        // NOTE: loops whose canonical paths are used by a single patch used to be cleared
+        // here. Those are mostly patches sitting on the model's OPEN boundary, where a
+        // path legitimately belongs to exactly one loop - clearing punched holes along
+        // open borders (boundary edges + stray components). Short loops are emitted as a
+        // fan by extract_patch_quads instead.
 
         while (patches[p].boundary_loop.size() >= 2 && patches[p].boundary_loop.size() < 4) {
             size_t best_k = INVALID_INDEX;

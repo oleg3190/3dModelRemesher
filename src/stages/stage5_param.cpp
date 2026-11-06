@@ -649,6 +649,10 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
         graph.edge_paths[e].integer_divisions = d_int[e];
     }
 
+    // (Sliver loops with < 4 paths are intentionally NOT special-cased here: bumping their
+    //  divisions produced isolated islands - the patch across such a path does not carry
+    //  that path in its own loop, so the extra samples cannot stitch anything together.)
+
     // ---- Parity fix: every patch loop must hold an EVEN number of samples -----------
     // The sample-level 4-corner split (i2 = N/2, i3 = i1 + N/2) needs N even. Flipping
     // one path's division count toggles the parity of exactly the two patches that share
