@@ -765,6 +765,12 @@ QrmStatus Stage0Prep::execute(RemeshContext& ctx) {
     std::vector<uint16_t> mat_ids;
     std::vector<uint32_t> old_to_new_v;
     float weld_eps = 1e-6f * ctx.bbox_diag;
+    // T3b (S35): relax weld tolerance via env to collapse near-coincident book vertices so
+    // keep-best-2 does not need slivers to stay one component. Default 1 = current behaviour.
+    if (const char* e = std::getenv("QREMESH_WELD_SCALE")) {
+        float s = std::atof(e);
+        if (s > 1.0f) weld_eps *= s;
+    }
 
     if (!weld_vertices(in->positions, in->nv, in->tri_indices, in->nt, in->tri_material_ids, weld_eps, welded_pos, welded_tris, mat_ids, old_to_new_v)) {
         return QRM_ERR_INVALID_INPUT;
