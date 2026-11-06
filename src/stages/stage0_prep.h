@@ -23,7 +23,8 @@ private:
     static bool fix_manifold_and_orient(
         std::vector<Vec3f>& positions,
         std::vector<uint32_t>& triangles,
-        std::vector<uint16_t>& materials
+        std::vector<uint16_t>& materials,
+        bool nm_keep_best = false
     );
 
     static void fill_small_holes(

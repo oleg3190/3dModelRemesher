@@ -1490,7 +1490,7 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     // genuinely multi-part model keeps its real parts (they are large), dust disappears.
     // Runs BEFORE the quality report so reported boundary/components reflect the result.
     // Env QREMESH_DROP_ISLANDS (abs floor 50 quads default, ratio 0.01; QREMESH_ISLAND_*).
-    if (std::getenv("QREMESH_DROP_ISLANDS")) {
+    if (ctx.repair.drop_islands) {
         size_t nq = qmesh.polygons.size();
         std::unordered_map<uint64_t, uint32_t> edge2face;  // undirected edge -> a face
         std::vector<uint32_t> par(nq);

@@ -2,6 +2,7 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <cstdlib>
 
 namespace qremesh {
 
@@ -23,6 +24,29 @@ RemeshContext::RemeshContext(
             static_cast<size_t>(params->num_threads)
         );
     }
+
+    // Resolve input-repair priority: params (explicit) > env > default OFF.
+    auto tri = [](int8_t field, const char* env) -> bool {
+        if (field >= 0) return field != 0;            // CLI/preset wins
+        return std::getenv(env) != nullptr;           // low-level env override
+    };
+    repair.nm_keep_best = tri(params ? params->nm_keep_best : -1, "QREMESH_NM_KEEP_BEST");
+    repair.drop_debris  = tri(params ? params->drop_debris  : -1, "QREMESH_DROP_DEBRIS");
+    repair.drop_islands = tri(params ? params->drop_islands : -1, "QREMESH_DROP_ISLANDS");
+    if (params && params->weld_scale > 0.0f) {
+        repair.weld_scale = params->weld_scale;        // CLI/preset wins
+    } else if (const char* e = std::getenv("QREMESH_WELD_SCALE")) {
+        repair.weld_scale = std::atof(e);              // low-level env override
+    }
+
+    // Effective-config banner (reproducibility): shows what the resolver decided and from
+    // where. A clean default caller sees all-off -> baseline bit-identical, and the banner
+    // is the only addition (stderr, no stdout pollution of the quality report).
+    std::cerr << "[config] nm_keep_best=" << (repair.nm_keep_best ? "on" : "off")
+              << " weld_scale=" << repair.weld_scale
+              << " drop_debris=" << (repair.drop_debris ? "on" : "off")
+              << " drop_islands=" << (repair.drop_islands ? "on" : "off")
+              << std::endl;
 }
 
 bool RemeshContext::notify_progress(float progress, const char* stage_name) {

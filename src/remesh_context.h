@@ -30,6 +30,19 @@ public:
     QrmProgressFn progress_cb = nullptr;
     void* user_data = nullptr;
 
+    // --- Resolved input-repair settings (S40) -----------------------------------------
+    // Priority: explicit QrmParams field (>=0, set by the CLI from --quality/--nm-policy/...)
+    //   > QREMESH_* env (low-level override, kept working) > built-in default (OFF).
+    // Resolved ONCE in the constructor so stages read ctx.repair.* and never getenv, and the
+    // effective config can be logged reproducibly.
+    struct Repair {
+        bool  nm_keep_best = false;
+        bool  drop_debris = false;
+        bool  drop_islands = false;
+        float weld_scale = 0.0f;   // 0 = none
+    };
+    Repair repair;
+
     // Timing
     std::chrono::high_resolution_clock::time_point start_time;
     float stage_times[7] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};

@@ -40,6 +40,14 @@ void qrm_default_params(QrmParams* p) {
     p->num_threads = 0;
     p->random_seed = 42;
     p->debug_dump_dir = nullptr;
+
+    // Input-repair / quality fields default to "auto": the library falls back to the
+    // QREMESH_* env override, then to OFF. This keeps the pre-preset behaviour bit-identical
+    // for every existing caller (addon, tests) that does not set them.
+    p->nm_keep_best = -1;
+    p->drop_debris = -1;
+    p->drop_islands = -1;
+    p->weld_scale = 0.0f;
 }
 
 QrmStatus qrm_remesh(

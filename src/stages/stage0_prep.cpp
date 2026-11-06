@@ -102,7 +102,8 @@ bool Stage0Prep::weld_vertices(
 bool Stage0Prep::fix_manifold_and_orient(
     std::vector<Vec3f>& positions,
     std::vector<uint32_t>& triangles,
-    std::vector<uint16_t>& materials
+    std::vector<uint16_t>& materials,
+    bool nm_keep_best
 ) {
     uint32_t nt = static_cast<uint32_t>(triangles.size() / 3);
     if (nt == 0) return false;
@@ -152,7 +153,6 @@ bool Stage0Prep::fix_manifold_and_orient(
     // fix is to keep the two faces whose normals AGREE most (the true manifold surface) and
     // drop the rest. Env QREMESH_NM_KEEP_BEST selects the smarter rule (default off -> keeps
     // prior behaviour bit-identical).
-    const bool nm_keep_best = std::getenv("QREMESH_NM_KEEP_BEST") != nullptr;
     auto tri_normal = [&](uint32_t f) -> Vec3f {
         uint32_t a = triangles[3 * f], b = triangles[3 * f + 1], c = triangles[3 * f + 2];
         Vec3f n = (positions[b] - positions[a]).cross(positions[c] - positions[a]);
@@ -174,8 +174,10 @@ bool Stage0Prep::fix_manifold_and_orient(
         // that two edges disagree about (which the naive single-pass keep-best-2 caused ->
         // disconnected islands: 1 -> 4 components).
         std::unordered_map<uint32_t, int> face_reject;   // faceId -> #edges excluding it
+        size_t nm_edges = 0;
         for (const auto& pair : edge_to_faces) {
             if (pair.second.size() <= 2) continue;
+            nm_edges++;
             const auto& fl = pair.second;
             int best_i = -1, best_j = -1; float best_dot = -2.0f;
             for (size_t a = 0; a < fl.size(); ++a) {
@@ -192,6 +194,10 @@ bool Stage0Prep::fix_manifold_and_orient(
                 if ((int)f != best_i && (int)f != best_j) face_reject[(uint32_t)f]++;
         }
         for (const auto& kv : face_reject) face_valid[kv.first] = false;
+        std::cout << "[nm-repair] keep_best_applied=" << (nm_edges ? 1 : 0)
+                  << " nonmanifold_edges=" << nm_edges
+                  << " removed_nm_branches=" << face_reject.size()
+                  << (nm_edges ? "" : " reason=no_nonmanifold_edges") << std::endl;
     }
 
     // 3. BFS Normal orientation with conflict pruning
@@ -765,19 +771,15 @@ QrmStatus Stage0Prep::execute(RemeshContext& ctx) {
     std::vector<uint16_t> mat_ids;
     std::vector<uint32_t> old_to_new_v;
     float weld_eps = 1e-6f * ctx.bbox_diag;
-    // T3b (S35): relax weld tolerance via env to collapse near-coincident book vertices so
-    // keep-best-2 does not need slivers to stay one component. Default 1 = current behaviour.
-    if (const char* e = std::getenv("QREMESH_WELD_SCALE")) {
-        float s = std::atof(e);
-        if (s > 1.0f) weld_eps *= s;
-    }
+    // T3b (S35/S40): weld-scale comes from the resolved repair (params > env > default).
+    if (ctx.repair.weld_scale > 1.0f) weld_eps *= ctx.repair.weld_scale;
 
     if (!weld_vertices(in->positions, in->nv, in->tri_indices, in->nt, in->tri_material_ids, weld_eps, welded_pos, welded_tris, mat_ids, old_to_new_v)) {
         return QRM_ERR_INVALID_INPUT;
     }
 
     // Step 2: Manifold repair & orient
-    if (!fix_manifold_and_orient(welded_pos, welded_tris, mat_ids) || welded_tris.size() < 12) {
+    if (!fix_manifold_and_orient(welded_pos, welded_tris, mat_ids, ctx.repair.nm_keep_best) || welded_tris.size() < 12) {
         return QRM_ERR_TOPOLOGY_UNFIXABLE;
     }
 
@@ -809,7 +811,7 @@ QrmStatus Stage0Prep::execute(RemeshContext& ctx) {
     // their real parts but dust vanishes. This runs before the BVH is built, so the reference
     // surface matches the cleaned mesh. Env-gated: QREMESH_DROP_DEBRIS (ratio opt via
     // QREMESH_DEBRIS_RATIO, default 0.02 of the largest component).
-    if (std::getenv("QREMESH_DROP_DEBRIS")) {
+    if (ctx.repair.drop_debris) {
         uint32_t nf = static_cast<uint32_t>(welded_tris.size() / 3);
         // union-find over faces sharing an edge
         std::vector<uint32_t> parent(nf);

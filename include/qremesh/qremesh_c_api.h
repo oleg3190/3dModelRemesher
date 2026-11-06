@@ -75,6 +75,19 @@ typedef struct QrmParams {
     uint32_t num_threads;            // 0 = все доступные ядра
     uint32_t random_seed;            // Фиксированный seed для 100% детерминизма (по умолч. 42)
     const char* debug_dump_dir;      // NULL или путь к папке для сохранения OBJ по стадиям
+
+    // --- Input repair / quality preset (S40) -----------------------------------------
+    // Tri-state: -1 = auto (fall back to the QREMESH_* env override, then built-in
+    // default OFF), 0 = explicitly off, 1 = explicitly on. Priority for the CLI path is
+    // explicit flag > --quality preset > env > built-in default, which the CLI resolves
+    // into these fields BEFORE calling qrm_remesh; the library treats a set (>=0) field as
+    // authoritative and only consults env when the field is left at -1. Keeping the
+    // defaults at -1 means qrm_default_params reproduces the pre-preset behaviour exactly
+    // (bit-identical baseline for callers that never touch these fields).
+    int8_t nm_keep_best;             // non-manifold keep-best-2 repair (safe on clean input)
+    int8_t drop_debris;              // drop disconnected dust components (aggressive)
+    int8_t drop_islands;             // drop final island shells (single-shell policy)
+    float  weld_scale;               // weld-tolerance multiplier; 0 = auto/none
 } QrmParams;
 
 typedef struct QrmQualityReport {

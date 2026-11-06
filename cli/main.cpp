@@ -1,4 +1,5 @@
 #include "qremesh/qremesh_c_api.h"
+#include <cstring>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -74,14 +75,77 @@ static bool progress_callback(float p, const char* stage, void*) {
 
 int main(int argc, char** argv) {
     std::cout << "=== QRemesh CLI ===" << std::endl;
-    if (argc < 3) {
-        std::cout << "Usage: qremesh_cli <input.obj> <output.obj> [target_quads] [debug_dump_dir]" << std::endl;
+    if (argc < 2) {
+        std::cout << "Usage: qremesh_cli <input.obj> [-o <output.obj>] [target_quads] [debug_dump_dir] [adaptive_density]\n"
+                  << "       positional args keep working; named flags add:\n"
+                  << "         -o, --output PATH        output path\n"
+                  << "         --target N               target quad count\n"
+                  << "         --quality[=off|safe|full] input-repair preset (default full)\n"
+                  << "             safe = keep-best-2 only; full = weld500 + keep-best + debris\n"
+                  << "         --nm-policy=off|keep-best   non-manifold repair (wins over preset)\n"
+                  << "         --no-nm-repair              alias --nm-policy=off\n"
+                  << "         --no-weld                  disable the preset weld relaxation\n"
+                  << "         --drop-debris=on|off       dust removal\n"
+                  << "         --single-shell / --drop-islands[=on|off]  final island drop\n"
+                  << "Priority: explicit flag > --quality preset > QREMESH_* env > built-in default(off).\n"
+                  << "--quality never changes the polygon target.\n";
         return 0;
     }
 
-    std::string in_path = argv[1];
-    std::string out_path = argv[2];
-    int target_quads = (argc > 3) ? std::atoi(argv[3]) : 3000;
+    std::string in_path, out_path;
+    int target_quads = 3000;
+    std::string dump_dir;
+    float density_override = -1.0f;
+    // Start every repair field at -1 (auto): only explicit flags / a preset make them
+    // authoritative; otherwise the library falls back to env then OFF (baseline preserved).
+    int8_t nm_keep_best = -1, drop_debris = -1, drop_islands = -1;
+    float weld_scale = 0.0f;
+
+    auto needs_val = [&](int i) -> bool { return i + 1 < argc; };
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "-o" || a == "--output") { if (needs_val(i)) out_path = argv[++i]; }
+        else if (a == "--target") { if (needs_val(i)) target_quads = std::atoi(argv[++i]); }
+        else if (a.rfind("--target=", 0) == 0) target_quads = std::atoi(a.substr(9).c_str());
+        else if (a == "--quality") { // bare = full
+            nm_keep_best = 1; drop_debris = 1; weld_scale = 500.0f; drop_islands = 0;
+        }
+        else if (a.rfind("--quality=", 0) == 0) {
+            std::string v = a.substr(10);
+            if (v == "off") { nm_keep_best = 0; drop_debris = 0; drop_islands = 0; weld_scale = 0.0f; }
+            else if (v == "safe") { nm_keep_best = 1; drop_debris = 0; drop_islands = 0; weld_scale = 0.0f; }
+            else /* full */ { nm_keep_best = 1; drop_debris = 1; weld_scale = 500.0f; drop_islands = 0; }
+        }
+        else if (a.rfind("--nm-policy=", 0) == 0) {
+            std::string v = a.substr(12);
+            nm_keep_best = (v == "off" || v == "keep-all" || v == "none") ? 0 : 1;
+        }
+        else if (a == "--no-nm-repair") nm_keep_best = 0;
+        else if (a == "--no-weld") weld_scale = 0.0f;
+        else if (a.rfind("--weld-scale=", 0) == 0) weld_scale = std::atof(a.substr(13).c_str());
+        else if (a.rfind("--drop-debris", 0) == 0) {
+            std::string v = a.size() > 13 && a[13] == '=' ? a.substr(14) : "on";
+            drop_debris = (v == "off") ? 0 : 1;
+        }
+        else if (a == "--single-shell" || a == "--drop-islands") drop_islands = 1;
+        else if (a.rfind("--drop-islands=", 0) == 0) drop_islands = (a.substr(15) == "off") ? 0 : 1;
+        else if (a.rfind("--dump=", 0) == 0) dump_dir = a.substr(7);
+        else if (a.rfind("--density=", 0) == 0) density_override = std::atof(a.substr(10).c_str());
+        else if (!a.empty() && a[0] == '-') { std::cerr << "Unknown option: " << a << std::endl; }
+        else positional.push_back(a);
+    }
+    // Positional fallback (legacy): in, out, target, dump, density.
+    if (!positional.empty()) in_path = positional[0];
+    if (out_path.empty() && positional.size() >= 2) out_path = positional[1];
+    if (positional.size() >= 3 && target_quads == 3000) target_quads = std::atoi(positional[2].c_str());
+    if (dump_dir.empty() && positional.size() >= 4) dump_dir = positional[3];
+    if (density_override < 0.0f && positional.size() >= 5) density_override = std::atof(positional[4].c_str());
+
+    if (in_path.empty() || out_path.empty()) {
+        std::cerr << "Error: need input and output paths" << std::endl;
+        return 1;
+    }
 
     std::ifstream file(in_path);
     if (!file.is_open()) {
@@ -136,14 +200,16 @@ int main(int argc, char** argv) {
     QrmParams params;
     qrm_default_params(&params);
     params.target_quad_count = target_quads;
-    std::string dump_dir;
-    if (argc > 4) {
-        dump_dir = argv[4];
-        params.debug_dump_dir = dump_dir.c_str();
+    params.nm_keep_best = nm_keep_best;
+    params.drop_debris = drop_debris;
+    params.drop_islands = drop_islands;
+    params.weld_scale = weld_scale;
+    std::string dump_dir_local = dump_dir;
+    if (!dump_dir_local.empty()) {
+        params.debug_dump_dir = dump_dir_local.c_str();
     }
-    if (argc > 5) {
-        // Optional: adaptive_density override (0.0 = uniform sizing .. 1.0 = max curvature adaptivity)
-        params.adaptive_density = static_cast<float>(std::atof(argv[5]));
+    if (density_override >= 0.0f) {
+        params.adaptive_density = density_override;
     }
 
     QrmMeshOut* mesh_out = nullptr;
