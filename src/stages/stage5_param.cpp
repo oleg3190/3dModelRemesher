@@ -7,6 +7,7 @@
 #include <queue>
 #include <cmath>
 #include <algorithm>
+#include <random>
 #include <iostream>
 
 namespace qremesh {
@@ -24,6 +25,7 @@ struct ExtractStats {
     size_t sum_nv = 0;
     size_t mismatch_patches = 0;   // opposite sides with different sample counts
     size_t degenerate_slots = 0;   // border grid slots mapping to the same vertex
+    size_t parity_hacks = 0;       // odd loop sample counts repaired by duplicating one
     void reset() { *this = ExtractStats{}; }
 };
 ExtractStats g_extract_stats;
@@ -33,7 +35,8 @@ size_t g_loop_discont_count = 0;
 
 void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     RemeshContext& ctx,
-    PatchGraph& graph
+    PatchGraph& graph,
+    double effective_target_override
 ) {
     if (graph.edge_paths.empty() || graph.patches.empty()) return;
 
@@ -67,8 +70,13 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
         return;
     }
 
-    double effective_target = static_cast<double>(target) * 0.92;
-    if (ctx.active_symmetry_axis >= 0 && ctx.active_symmetry_axis <= 2) {
+    // effective_target_override > 0 means the caller already computed the budget (count
+    // calibration pass) - then symmetry must not be applied a second time.
+    double effective_target = (effective_target_override > 0.0)
+        ? effective_target_override
+        : static_cast<double>(target) * 0.92;
+    if (effective_target_override <= 0.0 &&
+        ctx.active_symmetry_axis >= 0 && ctx.active_symmetry_axis <= 2) {
         effective_target *= 0.5;
     }
 
@@ -234,20 +242,42 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
                 total += 1;
                 continue;
             }
-            size_t i0 = patch.corner_indices[0];
-            size_t i1 = patch.corner_indices[1];
-            size_t i2 = patch.corner_indices[2];
-            size_t i3 = patch.corner_indices[3];
-
-            int d0_sum = 0, d1_sum = 0, d2_sum = 0, d3_sum = 0;
-            for (size_t k = i0; k < i1; ++k) d0_sum += d_test[patch.boundary_loop[k].edge_path_id];
-            for (size_t k = i1; k < i2; ++k) d1_sum += d_test[patch.boundary_loop[k].edge_path_id];
-            for (size_t k = i2; k < i3; ++k) d2_sum += d_test[patch.boundary_loop[k].edge_path_id];
-            for (size_t k = i3; k < M; ++k)  d3_sum += d_test[patch.boundary_loop[k].edge_path_id];
-
-            int nu = std::max(1, std::max(d0_sum, d2_sum));
-            int nv = std::max(1, std::max(d1_sum, d3_sum));
-            total += static_cast<int64_t>(nu) * nv;
+            // Sample-level corners: N = loop sample count; the u-corner is snapped to the
+            // nearest path boundary (same rule as extract_patch_quads) so the estimate
+            // matches what extraction actually produces.
+            int64_t N = 0;
+            for (size_t k = 0; k < M; ++k) {
+                N += d_test[patch.boundary_loop[k].edge_path_id];
+            }
+            if (N < 4) {
+                total += 1;
+                continue;
+            }
+            int64_t i2 = N / 2;
+            int64_t i1 = N / 4;
+            {
+                int64_t acc = 0;
+                int64_t best = i1;
+                int64_t best_diff = i1;
+                for (size_t k = 0; k + 1 < M; ++k) {
+                    acc += std::max(1, d_test[patch.boundary_loop[k].edge_path_id]);
+                    if (acc >= i2) break;
+                    if (acc < 1) continue;
+                    int64_t diff = (acc > i1) ? acc - i1 : i1 - acc;
+                    // Snapping to the nearest path boundary puts the corner on a geometric
+                    // junction; both estimator and extraction use the SAME rule so the quad
+                    // budget stays consistent (calibration then lands within a few percent).
+                    if (diff <= best_diff) { best_diff = diff; best = acc; }
+                }
+                i1 = best;
+            }
+            if (i1 < 1) i1 = 1;
+            if (i1 > i2 - 1) i1 = i2 - 1;
+            int64_t nu = i1;
+            int64_t nv = i2 - i1;
+            if (nu < 1) nu = 1;
+            if (nv < 1) nv = 1;
+            total += nu * nv;
         }
         return total;
     };
@@ -353,48 +383,81 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     Eigen::VectorXd lambda = cg.solve(rhs);
     Eigen::VectorXd d_cont = d0 - AT * lambda;
 
-    // Integer rounding & greedy integer adjustment to minimize || A * d_int ||_2^2
+    // Integer rounding + greedy + signed-graph BFS repair, run MULTI-START.
+    // A single deterministic rounding gets stuck in a local optimum (on the test model:
+    // residual 266 over 221 unsatisfied opposite-side pairs), which is exactly what makes
+    // 167 patches emit degenerate border cells -> extra triangles and skewed quads.
+    // Restarts of the same repair pipeline (seeded from params->random_seed, so runs stay
+    // bit-deterministic) reach far lower residuals, usually zero. The greedy additionally
+    // pays a small penalty for drifting away from the metric solution d0 so that the
+    // density stays where the sizing field wants it (aspect ratio does not degrade).
     std::vector<int> d_int(num_edges);
+    std::vector<int> r(num_rows, 0);
+    int64_t E_res = 0;
+
+    std::vector<int> d_best;
+    std::vector<int> r_best;
+    int64_t E_best = -1;
+    int64_t drift_best = 0;
+
+    std::mt19937 rng(ctx.params->random_seed ? ctx.params->random_seed : 42u);
+    std::normal_distribution<double> noise(0.0, 0.35);
+    constexpr int NUM_RESTARTS = 32;
+
+    for (int restart = 0; restart < NUM_RESTARTS; ++restart) {
     for (size_t e = 0; e < num_edges; ++e) {
-        d_int[e] = std::clamp(static_cast<int>(std::round(d_cont[e])), 1, 100);
+        double v = d_cont[e] + ((restart == 0) ? 0.0 : noise(rng));
+        d_int[e] = std::clamp(static_cast<int>(std::round(v)), 1, 100);
     }
 
-    std::vector<int> r(num_rows, 0);
+    r.assign(num_rows, 0);
     for (int k = 0; k < A.outerSize(); ++k) {
         for (Eigen::SparseMatrix<double>::InnerIterator it(A, k); it; ++it) {
             r[it.row()] += static_cast<int>(it.value()) * d_int[it.col()];
         }
     }
 
-    int64_t E_res = 0;
+    E_res = 0;
     for (int val : r) E_res += static_cast<int64_t>(val) * val;
 
-    for (int iter = 0; iter < 4000 && E_res > 0; ++iter) {
+    for (int iter = 0; iter < 1500 && E_res > 0; ++iter) {
         int best_e = -1;
         int best_delta = 0;
-        int64_t best_dE = 0;
+        int64_t best_dE_res = 0;
+        double best_dE_total = 0.0;
+        constexpr double DRIFT_W = 0.1;
 
         for (size_t e = 0; e < num_edges; ++e) {
             for (int delta : {-1, 1}) {
                 if (d_int[e] + delta < 1 || d_int[e] + delta > 100) continue;
-                int64_t dE = 0;
+                int64_t dE_res = 0;
                 for (const auto& entry : col_entries[e]) {
-                    dE += 2 * delta * r[entry.row] * entry.coeff + entry.coeff * entry.coeff;
+                    dE_res += 2 * delta * r[entry.row] * entry.coeff + entry.coeff * entry.coeff;
                 }
-                if (dE < best_dE) {
-                    best_dE = dE;
+                // keep density close to the metric solution d0
+                double dev = static_cast<double>(d_int[e]) - d0[e];
+                double ndev = dev + delta;
+                double dE_total = static_cast<double>(dE_res) +
+                                  DRIFT_W * (ndev * ndev - dev * dev);
+                if (dE_total < best_dE_total) {
+                    best_dE_total = dE_total;
+                    best_dE_res = dE_res;
                     best_e = static_cast<int>(e);
                     best_delta = delta;
                 }
             }
         }
 
-        if (best_dE >= 0) break;
-        d_int[best_e] += best_delta;
-        for (const auto& entry : col_entries[best_e]) {
-            r[entry.row] += best_delta * entry.coeff;
+        if (best_dE_total >= 0.0) break;
+        if (best_e >= 0) {
+            d_int[best_e] += best_delta;
+            for (const auto& entry : col_entries[best_e]) {
+                r[entry.row] += best_delta * entry.coeff;
+            }
+            E_res += best_dE_res;
+        } else {
+            break;
         }
-        E_res += best_dE;
     }
 
     // Signed-graph BFS augmenting paths to cancel opposite-side residuals across intermediate patches
@@ -515,6 +578,34 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
         if (!any_augmented) break;
     }
 
+        // exact residual (guards against any drift between updates)
+        E_res = 0;
+        for (int val : r) E_res += static_cast<int64_t>(val) * val;
+
+        // ---- keep the best restart ----
+        int64_t drift = 0;
+        for (size_t e = 0; e < num_edges; ++e) {
+            int64_t diff = static_cast<int64_t>(d_int[e]) -
+                           static_cast<int64_t>(std::lround(d0[e]));
+            drift += (diff < 0) ? -diff : diff;
+        }
+        bool better = (E_best < 0) || (E_res < E_best) ||
+                      (E_res == E_best && drift < drift_best);
+        if (better) {
+            E_best = E_res;
+            drift_best = drift;
+            d_best = d_int;
+            r_best = r;
+        }
+        if (E_best == 0 && restart >= 8) break;
+    } // for restart
+
+    if (E_best >= 0) {
+        d_int = std::move(d_best);
+        r = std::move(r_best);
+        E_res = E_best;
+    }
+
     // 5b. Patch-local corner refinement: for patches whose opposite side sums still differ,
     //     search an alternative 4-corner split that makes both pairs exactly equal under the
     //     solved divisions. Removes degenerate border cells without touching d_int.
@@ -549,6 +640,82 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
 
     for (size_t e = 0; e < num_edges; ++e) {
         graph.edge_paths[e].integer_divisions = d_int[e];
+    }
+
+    // ---- Parity fix: every patch loop must hold an EVEN number of samples -----------
+    // The sample-level 4-corner split (i2 = N/2, i3 = i1 + N/2) needs N even. Flipping
+    // one path's division count toggles the parity of exactly the two patches that share
+    // it, so this is a linear system over GF(2): one row per patch, one unknown per path.
+    // Solving it keeps the metric densities intact (unlike forcing every path to an even
+    // count, which raised the minimum patch density and broke the quad budget).
+    {
+        const size_t n_paths = num_edges;
+        const size_t W = (n_paths + 63) / 64;
+        struct GfRow {
+            std::vector<uint64_t> bits;
+            uint8_t b = 0;
+        };
+        std::vector<GfRow> rows;
+        rows.reserve(graph.patches.size());
+        for (const auto& patch : graph.patches) {
+            if (patch.boundary_loop.size() < 4) continue;
+            GfRow row;
+            row.bits.assign(W, 0);
+            int64_t N = 0;
+            for (const auto& eref : patch.boundary_loop) {
+                uint32_t e = eref.edge_path_id;
+                if (e >= n_paths) continue;
+                N += graph.edge_paths[e].integer_divisions;
+                row.bits[e >> 6] ^= (1ull << (e & 63));
+            }
+            row.b = static_cast<uint8_t>(N & 1); // odd number of flips -> N becomes even
+            rows.push_back(std::move(row));
+        }
+
+        auto leading_bit = [](const GfRow& row, size_t ncols) -> size_t {
+            for (size_t c = 0; c < ncols; ++c) {
+                if ((row.bits[c >> 6] >> (c & 63)) & 1ull) return c;
+            }
+            return ncols;
+        };
+
+        size_t r = 0;
+        for (size_t c = 0; c < n_paths && r < rows.size(); ++c) {
+            size_t sel = r;
+            bool found = false;
+            for (size_t i = r; i < rows.size(); ++i) {
+                if ((rows[i].bits[c >> 6] >> (c & 63)) & 1ull) { sel = i; found = true; break; }
+            }
+            if (!found) continue;
+            std::swap(rows[r], rows[sel]);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                if (i != r && ((rows[i].bits[c >> 6] >> (c & 63)) & 1ull)) {
+                    for (size_t w = 0; w < W; ++w) rows[i].bits[w] ^= rows[r].bits[w];
+                    rows[i].b ^= rows[r].b;
+                }
+            }
+            ++r;
+        }
+
+        std::vector<uint8_t> flip(n_paths, 0);
+        size_t unsolvable = 0;
+        for (const auto& row : rows) {
+            size_t lead = leading_bit(row, n_paths);
+            if (lead == n_paths) {
+                if (row.b) unsolvable++;   // no assignment can fix this patch
+                continue;
+            }
+            if (row.b) flip[lead] = 1;
+        }
+        size_t flips = 0;
+        for (size_t e = 0; e < n_paths; ++e) {
+            if (flip[e]) {
+                graph.edge_paths[e].integer_divisions += 1;
+                ++flips;
+            }
+        }
+        std::cout << "[stage5/parity] flips=" << flips
+                  << " unsolvable_patches=" << unsolvable << std::endl;
     }
 
     for (size_t p = 0; p < num_patches; ++p) {
@@ -665,23 +832,91 @@ void Stage5ParamAndExtract::extract_patch_quads(
         return;
     }
 
-    size_t c0 = patch.corner_indices[0];
-    size_t c1 = patch.corner_indices[1];
-    size_t c2 = patch.corner_indices[2];
-    size_t c3 = patch.corner_indices[3];
+    // ---- Sample-level corners ---------------------------------------------------
+    // The whole patch border as one canonical sample sequence (junction vertices occur
+    // once). Corners are placed IN SAMPLES, not on path boundaries, and opposite corners
+    // are exactly half a loop apart: side0/side2 and side1/side3 then hold the same number
+    // of samples BY CONSTRUCTION. Path-level corners could not guarantee that (only ~30 of
+    // 197 patches had a feasible split), which produced duplicated border samples ->
+    // degenerate cells, extra triangles and skewed quads.
+    std::vector<uint32_t> samples;
+    samples.reserve(64);
+    for (size_t k = 0; k < M; ++k) {
+        const auto& eref = patch.boundary_loop[k];
+        const auto& ep = graph.edge_paths[eref.edge_path_id];
+        const auto& sp = ep.out_sample_vertices;
+        if (sp.empty()) continue;
+        if (eref.forward) {
+            size_t start_s = samples.empty() ? 0 : 1;
+            for (size_t s = start_s; s < sp.size(); ++s) samples.push_back(sp[s]);
+        } else {
+            int start_s = samples.empty() ? static_cast<int>(sp.size()) - 1
+                                          : static_cast<int>(sp.size()) - 2;
+            for (int s = start_s; s >= 0; --s) samples.push_back(sp[static_cast<size_t>(s)]);
+        }
+    }
+    if (samples.size() > 1 && samples.front() == samples.back()) samples.pop_back();
 
-    auto side0 = get_side_sample_vertices(c0, c1);
-    auto side1 = get_side_sample_vertices(c1, c2);
-    auto side2 = get_side_sample_vertices(c2, c3);
-    auto side3 = get_side_sample_vertices(c3, M);
+    size_t N = samples.size();
+    if (N < 4) {
+        g_extract_stats.skipped_tiny_loop++;
+        return;
+    }
+    if (N % 2 != 0) {
+        // Even path divisions make this practically unreachable; duplicate a sample
+        // instead of dropping one (dropping would break stitching with the neighbour).
+        samples.push_back(samples.back());
+        ++N;
+        g_extract_stats.parity_hacks++;
+    }
 
-    size_t D0 = side0.empty() ? 1 : side0.size() - 1;
-    size_t D1 = side1.empty() ? 1 : side1.size() - 1;
-    size_t D2 = side2.empty() ? 1 : side2.size() - 1;
-    size_t D3 = side3.empty() ? 1 : side3.size() - 1;
+    size_t i0 = 0;
+    size_t i2 = N / 2;
+    size_t i1 = N / 4;
+    {
+        // snap the u-side corner to the canonical path boundary nearest to the quarter point
+        size_t acc = 0;
+        size_t best = i1;
+        size_t best_diff = i1;
+        for (size_t k = 0; k + 1 < M; ++k) {
+            const auto& eref = patch.boundary_loop[k];
+            acc += static_cast<size_t>(std::max(1, graph.edge_paths[eref.edge_path_id].integer_divisions));
+            if (acc >= i2) break;
+            if (acc < 1) continue;
+            size_t diff = (acc > i1) ? acc - i1 : i1 - acc;
+            // same rule as in evaluate_total_quads (kept in sync so the count estimate
+            // matches what extraction produces)
+            if (diff <= best_diff) {
+                best_diff = diff;
+                best = acc;
+            }
+        }
+        i1 = best;
+    }
+    if (i1 < 1) i1 = 1;
+    if (i1 > i2 - 1) i1 = i2 - 1;
+    size_t i3 = i1 + i2;
 
-    int nu = std::max(1, static_cast<int>(std::max(D0, D2)));
-    int nv = std::max(1, static_cast<int>(std::max(D1, D3)));
+    auto slice_cw = [&](size_t a, size_t b) -> std::vector<uint32_t> {
+        std::vector<uint32_t> out;
+        for (size_t idx = a;; idx = (idx + 1) % N) {
+            out.push_back(samples[idx]);
+            if (idx == b) break;
+        }
+        return out;
+    };
+    auto side0 = slice_cw(i0, i1);
+    auto side1 = slice_cw(i1, i2);
+    auto side2 = slice_cw(i2, i3);
+    auto side3 = slice_cw(i3, i0);
+
+    size_t D0 = side0.size() - 1;
+    size_t D1 = side1.size() - 1;
+    size_t D2 = side2.size() - 1;
+    size_t D3 = side3.size() - 1;
+
+    int nu = static_cast<int>(D0);
+    int nv = static_cast<int>(D1);
     g_extract_stats.sum_nu += static_cast<size_t>(nu);
     g_extract_stats.sum_nv += static_cast<size_t>(nv);
     if (D0 != D2 || D1 != D3) g_extract_stats.mismatch_patches++;
@@ -920,7 +1155,25 @@ QrmStatus Stage5ParamAndExtract::execute(
         return QRM_ERR_CANCELLED;
     }
 
-    balance_and_quantize_patch_sizes(ctx, graph);
+    // Count calibration: plan -> sample -> extract -> measure. The planner estimates the
+    // polygon count from path divisions, but corner snapping and the parity fix-up add a
+    // few percent on top, so one correction pass keeps the actual output within ~5% of
+    // the requested target.
+    double search_eff = -1.0;
+    double eff_used = 0.0;
+    const double eff_goal = static_cast<double>(ctx.params->target_quad_count) * 0.92 *
+        ((ctx.active_symmetry_axis >= 0 && ctx.active_symmetry_axis <= 2) ? 0.5 : 1.0);
+    double prev_want = -1.0;
+    int64_t prev_actual = -1;
+    size_t empty_loops = 0, short_loops = 0, loop_paths_total = 0, quads_from_loops = 0;
+    int64_t polys_before_weld = 0, verts_before_weld = 0;
+
+    for (int calib = 0; calib < 3; ++calib) {
+    balance_and_quantize_patch_sizes(ctx, graph, search_eff);
+    eff_used = (search_eff > 0.0)
+        ? search_eff
+        : static_cast<double>(ctx.params->target_quad_count) * 0.92 *
+          ((ctx.active_symmetry_axis >= 0 && ctx.active_symmetry_axis <= 2) ? 0.5 : 1.0);
 
     out_quads.positions.clear();
     out_quads.polygons.clear();
@@ -1004,7 +1257,7 @@ QrmStatus Stage5ParamAndExtract::execute(
 
     // 3. Extract quads for each patch
     g_extract_stats.reset();
-    size_t empty_loops = 0, short_loops = 0, loop_paths_total = 0, quads_from_loops = 0;
+    empty_loops = 0; short_loops = 0; loop_paths_total = 0; quads_from_loops = 0;
     for (const auto& patch : graph.patches) {
         if (patch.boundary_loop.empty()) empty_loops++;
         else if (patch.boundary_loop.size() < 4) short_loops++;
@@ -1017,8 +1270,8 @@ QrmStatus Stage5ParamAndExtract::execute(
         quads_from_loops += out_quads.polygons.size() - before;
     }
 
-    size_t polys_before_weld = out_quads.polygons.size();
-    size_t verts_before_weld = out_quads.positions.size();
+    polys_before_weld = static_cast<int64_t>(out_quads.polygons.size());
+    verts_before_weld = static_cast<int64_t>(out_quads.positions.size());
     std::cout << "[stage5/extract] used_loop=" << g_extract_stats.used_loop
               << " discont_loops=" << g_loop_discont_count
               << " used_fallback=" << g_extract_stats.used_fallback
@@ -1031,6 +1284,42 @@ QrmStatus Stage5ParamAndExtract::execute(
               << " mismatch_patches=" << g_extract_stats.mismatch_patches
               << " degenerate_slots=" << g_extract_stats.degenerate_slots
               << std::endl;
+
+        {
+            int64_t actual = static_cast<int64_t>(out_quads.polygons.size());
+            int64_t want = static_cast<int64_t>(eff_used);
+            int64_t goal = static_cast<int64_t>(eff_goal);
+            int64_t diff = actual - goal;
+            if (diff < 0) diff = -diff;
+            std::cout << "[stage5/calib] pass=" << calib << " actual=" << actual
+                      << " want=" << want << " goal=" << goal << std::endl;
+
+            if (calib >= 2 || goal <= 0) break;
+            if (diff * 20 <= goal) break;                 // within 5% of the budget
+            if (actual == prev_actual) break;             // density floor: no response
+
+            // Newton-style correction with the measured local exponent
+            //   actual ~ c * want^beta   =>   want' = want * (goal/actual)^(1/beta)
+            double beta = 1.0;
+            if (calib >= 1 && want != prev_want && prev_actual > 0) {
+                beta = std::log(static_cast<double>(actual) / static_cast<double>(prev_actual)) /
+                       std::log(static_cast<double>(want) / static_cast<double>(prev_want));
+            }
+            if (!(beta > 0.15) || beta > 3.0) beta = 1.0;
+
+            double next = static_cast<double>(want) *
+                std::pow(static_cast<double>(goal) / static_cast<double>(actual), 1.0 / beta);
+            double lo = 0.35 * static_cast<double>(want);
+            double hi = 2.50 * static_cast<double>(want);
+            if (next < lo) next = lo;
+            if (next > hi) next = hi;
+
+            prev_want = static_cast<double>(want);
+            prev_actual = actual;
+            search_eff = next;
+            continue;
+        }
+    } // for calib
 
     if (out_quads.polygons.empty()) {
         return QRM_ERR_PARAM_FAILED;

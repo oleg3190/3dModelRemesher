@@ -16,7 +16,8 @@ public:
 private:
     static void balance_and_quantize_patch_sizes(
         RemeshContext& ctx,
-        PatchGraph& graph
+        PatchGraph& graph,
+        double effective_target_override = -1.0
     );
 
     static void extract_patch_quads(
