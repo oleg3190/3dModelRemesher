@@ -6,6 +6,7 @@
 #include <map>
 #include <queue>
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <random>
 #include <iostream>
@@ -1262,6 +1263,41 @@ QrmStatus Stage5ParamAndExtract::execute(
         }
     }
 
+    // ---- S27: cross-side correspondence imbalance (the REAL skew source) --------------
+    // For each patch, opposite grid sides (0<->2 and 1<->3) must have proportional arc
+    // length so the i-th border node on one side FACES the i-th on the other. When the two
+    // sides differ in length but share the same division count (parity forces equal counts),
+    // the i<->i pairing slants every cell -> SJ<0.5 tail. Path spacing is already uniform
+    // (mean_cv 0.067), so THIS imbalance, not resampling, is what caps SJ.
+    {
+        double sum_ratio = 0.0; int np = 0; int bad = 0, verybad = 0;
+        for (size_t p = 0; p < graph.patches.size(); ++p) {
+            const auto& patch = graph.patches[p];
+            size_t M = patch.boundary_loop.size();
+            if (M < 4) continue;
+            size_t i0 = patch.corner_indices[0], i1 = patch.corner_indices[1];
+            size_t i2 = patch.corner_indices[2], i3 = patch.corner_indices[3];
+            auto side_len = [&](size_t a, size_t b) {
+                double L = 0.0;
+                for (size_t k = a; k < b; ++k)
+                    L += graph.edge_paths[patch.boundary_loop[k].edge_path_id].continuous_len;
+                return L;
+            };
+            double L0 = side_len(i0, i1), L2 = side_len(i2, i3);
+            double L1 = side_len(i1, i2), L3 = side_len(i3, M) + side_len(0, i0);
+            (void)L3;
+            double r = 1.0;
+            if (L0 > 1e-9 && L2 > 1e-9) r = std::max(r, std::max(L0, L2) / std::min(L0, L2));
+            if (L1 > 1e-9 && L3 > 1e-9) r = std::max(r, std::max(L1, L3) / std::min(L1, L3));
+            sum_ratio += r; ++np;
+            if (r > 1.5) bad++;
+            if (r > 2.0) verybad++;
+        }
+        std::cout << "[stage5/sides] patches=" << np
+                  << " mean_lenratio=" << (np ? sum_ratio / np : 0.0)
+                  << " ratio>1.5=" << bad << " ratio>2=" << verybad << std::endl;
+    }
+
     // 2. Canonical arc-length sampling for every path in graph.edge_paths
     for (auto& ep : graph.edge_paths) {
         int M = ep.integer_divisions;
@@ -1323,6 +1359,41 @@ QrmStatus Stage5ParamAndExtract::execute(
                 out_quads.seam_edges.emplace_back(ep.out_sample_vertices[s], ep.out_sample_vertices[s + 1]);
             }
         }
+    }
+
+    // ---- S27 measure-first: per-path step uniformity AFTER resampling -----------------
+    // CV = stddev / mean of consecutive sample-segment lengths along each path. If it is
+    // already ~0 the path is equidistant and the 37% skewed cells come from OPPOSITE-SIDE
+    // correspondence (L_side0 != L_side2 at equal division count -> slanted grid lines),
+    // which no single-path resampling can fix. Measure before choosing the fix.
+    {
+        double sum_cv = 0.0; int npath = 0;
+        double worst_cv = 0.0; uint32_t worst_id = 0; int worst_m = 0;
+        int cv_gt_20 = 0, cv_gt_40 = 0;
+        for (size_t pi = 0; pi < graph.edge_paths.size(); ++pi) {
+            const auto& ep = graph.edge_paths[pi];
+            const auto& sv = ep.out_sample_vertices;
+            if (sv.size() < 3) continue;
+            double sum = 0.0, ss = 0.0; int cnt = 0;
+            for (size_t s = 0; s + 1 < sv.size(); ++s) {
+                float dl = (out_quads.positions[sv[s + 1]] - out_quads.positions[sv[s]]).norm();
+                sum += dl; ss += (double)dl * dl; ++cnt;
+            }
+            if (cnt < 2) continue;
+            double mean = sum / cnt;
+            if (mean <= 1e-9) continue;
+            double var = ss / cnt - mean * mean;
+            double cv = (var > 0 ? std::sqrt(var) : 0.0) / mean;
+            sum_cv += cv; ++npath;
+            if (cv > 0.20) cv_gt_20++;
+            if (cv > 0.40) cv_gt_40++;
+            if (cv > worst_cv) { worst_cv = cv; worst_id = (uint32_t)pi; worst_m = cnt; }
+        }
+        std::cout << "[stage5/pathcv] paths=" << npath
+                  << " mean_cv=" << (npath ? sum_cv / npath : 0.0)
+                  << " cv>20%=" << cv_gt_20 << " cv>40%=" << cv_gt_40
+                  << " worst_cv=" << worst_cv << " (path" << worst_id
+                  << " segs=" << worst_m << ")" << std::endl;
     }
 
     // 3. Extract quads for each patch
