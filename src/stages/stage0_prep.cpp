@@ -146,12 +146,52 @@ bool Stage0Prep::fix_manifold_and_orient(
     }
 
     // Discard non-manifold faces (where edge has > 2 faces)
-    for (const auto& pair : edge_to_faces) {
-        if (pair.second.size() > 2) {
-            for (size_t k = 2; k < pair.second.size(); ++k) {
+    // keep-first-2 is ARBITRARY: on a "book" edge (4 faces) it may keep two pages that are
+    // a twisted sliver pair, which downstream becomes a degenerate patch (S33/T3: a cleaned
+    // input lifted median SJ 0.626 -> 0.707 even though qremesh already reached nm=0). The
+    // fix is to keep the two faces whose normals AGREE most (the true manifold surface) and
+    // drop the rest. Env QREMESH_NM_KEEP_BEST selects the smarter rule (default off -> keeps
+    // prior behaviour bit-identical).
+    const bool nm_keep_best = std::getenv("QREMESH_NM_KEEP_BEST") != nullptr;
+    auto tri_normal = [&](uint32_t f) -> Vec3f {
+        uint32_t a = triangles[3 * f], b = triangles[3 * f + 1], c = triangles[3 * f + 2];
+        Vec3f n = (positions[b] - positions[a]).cross(positions[c] - positions[a]);
+        float l = n.norm();
+        return (l > 1e-12f) ? n * (1.0f / l) : Vec3f(0, 0, 0);
+    };
+    if (!nm_keep_best) {
+        for (const auto& pair : edge_to_faces) {
+            if (pair.second.size() <= 2) continue;
+            for (size_t k = 2; k < pair.second.size(); ++k)
                 face_valid[pair.second[k]] = false;
-            }
         }
+    } else {
+        // Two-phase, NO mutation during selection so the choice is order-independent and
+        // coherent. Phase 1: for every non-manifold edge pick the best-2 (most coplanar) face
+        // PAIR and record, per face, how many of its book edges REJECT it. Phase 2: drop a
+        // face only if it was rejected by any non-manifold edge it belongs to (intersection of
+        // the per-edge keep sets). This removes twisted sliver pages without orphaning faces
+        // that two edges disagree about (which the naive single-pass keep-best-2 caused ->
+        // disconnected islands: 1 -> 4 components).
+        std::unordered_map<uint32_t, int> face_reject;   // faceId -> #edges excluding it
+        for (const auto& pair : edge_to_faces) {
+            if (pair.second.size() <= 2) continue;
+            const auto& fl = pair.second;
+            int best_i = -1, best_j = -1; float best_dot = -2.0f;
+            for (size_t a = 0; a < fl.size(); ++a) {
+                if (!face_valid[fl[a]]) continue;
+                Vec3f na = tri_normal(fl[a]);
+                for (size_t b = a + 1; b < fl.size(); ++b) {
+                    if (!face_valid[fl[b]]) continue;
+                    float d = na.dot(tri_normal(fl[b]));
+                    if (d > best_dot) { best_dot = d; best_i = (int)fl[a]; best_j = (int)fl[b]; }
+                }
+            }
+            if (best_i < 0) continue;   // <2 valid faces, nothing to exclude
+            for (size_t f : fl)
+                if ((int)f != best_i && (int)f != best_j) face_reject[(uint32_t)f]++;
+        }
+        for (const auto& kv : face_reject) face_valid[kv.first] = false;
     }
 
     // 3. BFS Normal orientation with conflict pruning
@@ -733,6 +773,26 @@ QrmStatus Stage0Prep::execute(RemeshContext& ctx) {
     // Step 2: Manifold repair & orient
     if (!fix_manifold_and_orient(welded_pos, welded_tris, mat_ids) || welded_tris.size() < 12) {
         return QRM_ERR_TOPOLOGY_UNFIXABLE;
+    }
+
+    // [stage0/manifold] diagnostic: count edges still shared by >2 faces after the internal
+    // repair. S33/T3 showed a non-manifold INPUT (2132 edges) costs median SJ ~0.08 and the
+    // SJ<0.5 tail ~10pp, so knowing whether stage0 already resolves them decides whether an
+    // intrinsic pre-repair (matching pymeshlab) is the missing lever.
+    {
+        std::unordered_map<uint64_t, int> ecount;
+        for (size_t f = 0; f + 2 < welded_tris.size(); f += 3) {
+            uint32_t a = welded_tris[f], b = welded_tris[f + 1], c = welded_tris[f + 2];
+            uint32_t tri[3][2] = {{a,b},{b,c},{c,a}};
+            for (auto& e : tri) {
+                uint32_t lo = std::min(e[0], e[1]), hi = std::max(e[0], e[1]);
+                ecount[(uint64_t(lo) << 32) | hi]++;
+            }
+        }
+        int nm = 0;
+        for (const auto& kv : ecount) if (kv.second > 2) nm++;
+        std::cout << "[stage0/manifold] faces_after_repair=" << welded_tris.size() / 3
+                  << " nonmanifold_edges=" << nm << std::endl;
     }
 
     // Step 3: Build reference BVH on original cleaned geometry
