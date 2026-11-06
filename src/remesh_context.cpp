@@ -25,14 +25,21 @@ RemeshContext::RemeshContext(
         );
     }
 
-    // Resolve input-repair priority: params (explicit) > env > default OFF.
-    auto tri = [](int8_t field, const char* env) -> bool {
+    // Resolve input-repair priority: params (explicit) > env > default.
+    // S41: nm_keep_best's BUILT-IN DEFAULT is ON. It is safe: on a clean watertight/open
+    // manifold input the non-manifold block never fires (regression showed clean outputs stay
+    // bit-identical to the pre-promotion baseline), and it only separates genuinely
+    // self-touching shells (it does not delete geometry - drop_islands does that, still OFF).
+    // weld_scale / drop_debris / drop_islands keep default OFF (they can alter/delete data),
+    // enabled only via --quality or their own flags.
+    auto tri = [](int8_t field, const char* env, bool dflt) -> bool {
         if (field >= 0) return field != 0;            // CLI/preset wins
-        return std::getenv(env) != nullptr;           // low-level env override
+        if (const char* e = std::getenv(env)) return *e && std::atoi(e) != 0;
+        return dflt;                                  // built-in default
     };
-    repair.nm_keep_best = tri(params ? params->nm_keep_best : -1, "QREMESH_NM_KEEP_BEST");
-    repair.drop_debris  = tri(params ? params->drop_debris  : -1, "QREMESH_DROP_DEBRIS");
-    repair.drop_islands = tri(params ? params->drop_islands : -1, "QREMESH_DROP_ISLANDS");
+    repair.nm_keep_best = tri(params ? params->nm_keep_best : -1, "QREMESH_NM_KEEP_BEST", true);
+    repair.drop_debris  = tri(params ? params->drop_debris  : -1, "QREMESH_DROP_DEBRIS", false);
+    repair.drop_islands = tri(params ? params->drop_islands : -1, "QREMESH_DROP_ISLANDS", false);
     if (params && params->weld_scale > 0.0f) {
         repair.weld_scale = params->weld_scale;        // CLI/preset wins
     } else if (const char* e = std::getenv("QREMESH_WELD_SCALE")) {

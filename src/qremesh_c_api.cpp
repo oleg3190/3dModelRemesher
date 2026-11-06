@@ -41,9 +41,11 @@ void qrm_default_params(QrmParams* p) {
     p->random_seed = 42;
     p->debug_dump_dir = nullptr;
 
-    // Input-repair / quality fields default to "auto": the library falls back to the
-    // QREMESH_* env override, then to OFF. This keeps the pre-preset behaviour bit-identical
-    // for every existing caller (addon, tests) that does not set them.
+    // Input-repair / quality fields default to "auto" (-1): the library falls back to the
+    // QREMESH_* env override, then to the built-in default. Post-S41 that default is
+    // nm_keep_best=ON (a no-op on clean manifold input; separates genuinely self-touching
+    // shells without deleting them); weld_scale / drop_debris / drop_islands default OFF and
+    // are turned on only by --quality or their own flags.
     p->nm_keep_best = -1;
     p->drop_debris = -1;
     p->drop_islands = -1;
