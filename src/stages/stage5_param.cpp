@@ -1095,37 +1095,41 @@ void Stage5ParamAndExtract::extract_patch_quads(
     g_extract_stats.sum_interior_verts += static_cast<size_t>(std::max(0, nu - 1)) *
                                            static_cast<size_t>(std::max(0, nv - 1));
 
-    // Iron out parameterization crinkles: Jacobi passes pulling every interior grid node
-    // towards the average of its four grid neighbours, re-projected onto the source surface.
-    // Border nodes belong to the shared canonical paths and are never touched, so patch
-    // stitching is unaffected. Overlapping/folded interior cells are what shows up as
-    // wrinkles (excess surface area) on the final mesh.
-    // More passes converge the map towards a harmonic (fold-free) one.
-    for (int pass = 0; pass < 24; ++pass) {
-        std::vector<uint32_t> nodes;
-        std::vector<Vec3f> targets;
-        const size_t est = static_cast<size_t>(std::max(0, nu - 1)) *
-                           static_cast<size_t>(std::max(0, nv - 1));
-        nodes.reserve(est);
-        targets.reserve(est);
+    // ---- Harmonic relaxation: Laplacian smoothing + BVH reprojection ------------------
+    // The Coons/transfinite initialization above is used ONLY to seed the interior 3D
+    // positions; on non-convex patch borders it folds cells (min SJ was NEGATIVE, warp
+    // ~180 deg). We now drive the map toward a discrete harmonic one (the linear Laplacian
+    // is the discrete analogue of harmonic parametrization):
+    //   * Dirichlet borders: the 4 grid sides are shared canonical-path vertices and are
+    //     NEVER moved, so patch stitching is untouched.
+    //   * Each interior node (i,j) is set to the arithmetic mean of its 4 topological
+    //     neighbours (i±1,j),(i,j±1). Gauss-Seidel (immediate in-place update, weight 1)
+    //     converges ~2x faster than the old damped Jacobi (0.5, deferred) and actually
+    //     untangles folded cells instead of crawling toward them.
+    //   * Anti-shrinkage: the mean is a soap-film contraction, so immediately after each
+    //     move the new point is snapped back onto the SOURCE surface (original_bvh closest
+    //     point). Snapping every node keeps the sheet glued to the geometry and orthogonal-
+    //     ising the cells, which is what lifts Scaled Jacobian and kills aspect.
+    // QREMESH_HARMONIC_ITERS overrides the iteration count.
+    int harmonic_iters = 16;
+    if (const char* e = std::getenv("QREMESH_HARMONIC_ITERS")) {
+        int v = std::atoi(e);
+        if (v >= 0) harmonic_iters = v;
+    }
+    for (int it = 0; it < harmonic_iters; ++it) {
         for (int i = 1; i < nu; ++i) {
             for (int j = 1; j < nv; ++j) {
-                const Vec3f& cur = out_quads.positions[grid[i][j]];
                 Vec3f avg = out_quads.positions[grid[i - 1][j]] +
                             out_quads.positions[grid[i + 1][j]] +
                             out_quads.positions[grid[i][j - 1]] +
                             out_quads.positions[grid[i][j + 1]];
                 avg *= 0.25f;
-                Vec3f p = cur + 0.5f * (avg - cur);
+                Vec3f p = avg;            // weight 1: full step to the neighbour mean
                 Vec3f cp, cn;
                 float d2;
-                if (ctx.original_bvh.closest_point(p, cp, cn, d2)) p = cp;
-                nodes.push_back(grid[i][j]);
-                targets.push_back(p);
+                if (ctx.original_bvh.closest_point(p, cp, cn, d2)) p = cp;  // snap (no shrink)
+                out_quads.positions[grid[i][j]] = p;   // Gauss-Seidel: apply immediately
             }
-        }
-        for (size_t k = 0; k < nodes.size(); ++k) {
-            out_quads.positions[nodes[k]] = targets[k];
         }
     }
 
