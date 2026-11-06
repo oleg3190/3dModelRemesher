@@ -1,6 +1,7 @@
 #include "stages/stage0_prep.h"
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <cmath>
 #include <iostream>
@@ -99,25 +100,51 @@ bool Stage0Prep::weld_vertices(
 }
 
 bool Stage0Prep::fix_manifold_and_orient(
-    std::vector<Vec3f>& /*positions*/,
+    std::vector<Vec3f>& positions,
     std::vector<uint32_t>& triangles,
     std::vector<uint16_t>& materials
 ) {
     uint32_t nt = static_cast<uint32_t>(triangles.size() / 3);
     if (nt == 0) return false;
 
-    // Count edge incidences
-    std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> edge_to_faces;
+    // 1. Discard duplicate triangles with identical vertex sets
+    std::vector<bool> face_valid(nt, true);
+    auto make_tri_key = [](uint32_t a, uint32_t b, uint32_t c) -> uint64_t {
+        if (a > b) std::swap(a, b);
+        if (b > c) std::swap(b, c);
+        if (a > b) std::swap(a, b);
+        return (static_cast<uint64_t>(a) * 73856093) ^
+               (static_cast<uint64_t>(b) * 19349663) ^
+               (static_cast<uint64_t>(c) * 83492791);
+    };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> tri_buckets;
     for (uint32_t f = 0; f < nt; ++f) {
+        uint32_t v0 = triangles[3 * f + 0];
+        uint32_t v1 = triangles[3 * f + 1];
+        uint32_t v2 = triangles[3 * f + 2];
+        tri_buckets[make_tri_key(v0, v1, v2)].push_back(f);
+    }
+    for (const auto& [k, fl] : tri_buckets) {
+        if (fl.size() > 1) {
+            for (size_t i = 1; i < fl.size(); ++i) {
+                face_valid[fl[i]] = false;
+            }
+        }
+    }
+
+    // 2. Count edge incidences for valid faces
+    std::unordered_map<uint64_t, std::vector<uint32_t>> edge_to_faces;
+    for (uint32_t f = 0; f < nt; ++f) {
+        if (!face_valid[f]) continue;
         uint32_t v[3] = { triangles[3 * f + 0], triangles[3 * f + 1], triangles[3 * f + 2] };
         for (int i = 0; i < 3; ++i) {
             uint32_t u0 = std::min(v[i], v[(i + 1) % 3]);
             uint32_t u1 = std::max(v[i], v[(i + 1) % 3]);
-            edge_to_faces[{u0, u1}].push_back(f);
+            uint64_t key = (static_cast<uint64_t>(u0) << 32) | u1;
+            edge_to_faces[key].push_back(f);
         }
     }
 
-    std::vector<bool> face_valid(nt, true);
     // Discard non-manifold faces (where edge has > 2 faces)
     for (const auto& pair : edge_to_faces) {
         if (pair.second.size() > 2) {
@@ -127,7 +154,7 @@ bool Stage0Prep::fix_manifold_and_orient(
         }
     }
 
-    // BFS Normal orientation
+    // 3. BFS Normal orientation with conflict pruning
     std::vector<bool> visited(nt, false);
     for (uint32_t start_f = 0; start_f < nt; ++start_f) {
         if (!face_valid[start_f] || visited[start_f]) continue;
@@ -139,6 +166,7 @@ bool Stage0Prep::fix_manifold_and_orient(
         while (!q.empty()) {
             uint32_t cur = q.front();
             q.pop();
+            if (!face_valid[cur]) continue;
 
             uint32_t cv[3] = { triangles[3 * cur + 0], triangles[3 * cur + 1], triangles[3 * cur + 2] };
             for (int i = 0; i < 3; ++i) {
@@ -146,12 +174,12 @@ bool Stage0Prep::fix_manifold_and_orient(
                 uint32_t cb = cv[(i + 1) % 3];
                 uint32_t u0 = std::min(ca, cb);
                 uint32_t u1 = std::max(ca, cb);
+                uint64_t key = (static_cast<uint64_t>(u0) << 32) | u1;
 
-                auto it = edge_to_faces.find({u0, u1});
+                auto it = edge_to_faces.find(key);
                 if (it != edge_to_faces.end()) {
                     for (uint32_t nbr : it->second) {
-                        if (nbr != cur && face_valid[nbr] && !visited[nbr]) {
-                            // Check if edge is traversed in opposite direction in nbr
+                        if (nbr != cur && face_valid[nbr]) {
                             uint32_t nv[3] = { triangles[3 * nbr + 0], triangles[3 * nbr + 1], triangles[3 * nbr + 2] };
                             bool same_direction = false;
                             for (int j = 0; j < 3; ++j) {
@@ -160,12 +188,19 @@ bool Stage0Prep::fix_manifold_and_orient(
                                     break;
                                 }
                             }
-                            if (same_direction) {
-                                // Flip nbr triangle
-                                std::swap(triangles[3 * nbr + 1], triangles[3 * nbr + 2]);
+                            if (!visited[nbr]) {
+                                if (same_direction) {
+                                    std::swap(triangles[3 * nbr + 1], triangles[3 * nbr + 2]);
+                                }
+                                visited[nbr] = true;
+                                q.push(nbr);
+                            } else {
+                                if (same_direction) {
+                                    // Non-orientable / Möbius seam conflict: drop current face
+                                    face_valid[cur] = false;
+                                    break;
+                                }
                             }
-                            visited[nbr] = true;
-                            q.push(nbr);
                         }
                     }
                 }
@@ -189,6 +224,154 @@ bool Stage0Prep::fix_manifold_and_orient(
             }
         }
     }
+
+    // 4. Split non-manifold vertices (where vertex link has multiple connected components)
+    {
+        uint32_t clean_nt = static_cast<uint32_t>(clean_tris.size() / 3);
+        std::vector<std::vector<uint32_t>> v_to_faces(positions.size());
+        for (uint32_t f = 0; f < clean_nt; ++f) {
+            for (int k = 0; k < 3; ++k) {
+                uint32_t v = clean_tris[3 * f + k];
+                if (v < v_to_faces.size()) {
+                    v_to_faces[v].push_back(f);
+                }
+            }
+        }
+
+        size_t original_v_count = positions.size();
+        size_t split_count = 0;
+        for (size_t v = 0; v < original_v_count; ++v) {
+            const auto& inc_faces = v_to_faces[v];
+            if (inc_faces.size() <= 1) continue;
+
+            // Map each neighbor vertex to the faces containing the edge (v, neighbor)
+            std::unordered_map<uint32_t, std::vector<uint32_t>> edge_arms;
+            for (uint32_t f : inc_faces) {
+                uint32_t fv[3] = { clean_tris[3 * f + 0], clean_tris[3 * f + 1], clean_tris[3 * f + 2] };
+                for (int k = 0; k < 3; ++k) {
+                    if (fv[k] != v) {
+                        edge_arms[fv[k]].push_back(f);
+                    }
+                }
+            }
+
+            // Build adjacency between faces in inc_faces
+            std::unordered_map<uint32_t, std::vector<uint32_t>> face_adj;
+            for (const auto& [nbr, flist] : edge_arms) {
+                if (flist.size() == 2) {
+                    face_adj[flist[0]].push_back(flist[1]);
+                    face_adj[flist[1]].push_back(flist[0]);
+                }
+            }
+
+            // Find connected components among inc_faces
+            std::unordered_set<uint32_t> visited_faces;
+            std::vector<std::vector<uint32_t>> components;
+
+            for (uint32_t f : inc_faces) {
+                if (visited_faces.count(f)) continue;
+                std::vector<uint32_t> comp;
+                std::queue<uint32_t> q;
+                q.push(f);
+                visited_faces.insert(f);
+
+                while (!q.empty()) {
+                    uint32_t cur = q.front();
+                    q.pop();
+                    comp.push_back(cur);
+
+                    for (uint32_t nxt : face_adj[cur]) {
+                        if (!visited_faces.count(nxt)) {
+                            visited_faces.insert(nxt);
+                            q.push(nxt);
+                        }
+                    }
+                }
+                components.push_back(std::move(comp));
+            }
+
+            if (components.size() > 1) {
+                split_count += (components.size() - 1);
+                for (size_t c = 1; c < components.size(); ++c) {
+                    uint32_t new_v = static_cast<uint32_t>(positions.size());
+                    positions.push_back(positions[v]);
+
+                    for (uint32_t f : components[c]) {
+                        for (int k = 0; k < 3; ++k) {
+                            if (clean_tris[3 * f + k] == v) {
+                                clean_tris[3 * f + k] = new_v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::cout << "[stage0] non-manifold vertices split: " << split_count 
+                  << " (verts: " << original_v_count << " -> " << positions.size() << ")" << std::endl;
+
+        // Remove tiny disconnected floating triangle burrs (< 25 faces) detached by pinch splitting
+        if (clean_nt > 100) {
+            std::unordered_map<uint64_t, std::vector<uint32_t>> edge_to_f;
+            edge_to_f.reserve(clean_nt * 2);
+            for (uint32_t f = 0; f < clean_nt; ++f) {
+                uint32_t fv[3] = { clean_tris[3 * f + 0], clean_tris[3 * f + 1], clean_tris[3 * f + 2] };
+                for (int k = 0; k < 3; ++k) {
+                    uint32_t u = std::min(fv[k], fv[(k + 1) % 3]);
+                    uint32_t v = std::max(fv[k], fv[(k + 1) % 3]);
+                    edge_to_f[(static_cast<uint64_t>(u) << 32) | v].push_back(f);
+                }
+            }
+
+            std::vector<int> f_comp(clean_nt, -1);
+            std::vector<size_t> comp_sizes;
+            size_t max_comp_sz = 0;
+
+            for (uint32_t f = 0; f < clean_nt; ++f) {
+                if (f_comp[f] >= 0) continue;
+                int cid = static_cast<int>(comp_sizes.size());
+                size_t sz = 0;
+                std::queue<uint32_t> fq;
+                fq.push(f);
+                f_comp[f] = cid;
+                while (!fq.empty()) {
+                    uint32_t cf = fq.front();
+                    fq.pop();
+                    sz++;
+                    uint32_t fv[3] = { clean_tris[3 * cf + 0], clean_tris[3 * cf + 1], clean_tris[3 * cf + 2] };
+                    for (int k = 0; k < 3; ++k) {
+                        uint32_t u = std::min(fv[k], fv[(k + 1) % 3]);
+                        uint32_t v = std::max(fv[k], fv[(k + 1) % 3]);
+                        for (uint32_t nf_idx : edge_to_f[(static_cast<uint64_t>(u) << 32) | v]) {
+                            if (f_comp[nf_idx] < 0) {
+                                f_comp[nf_idx] = cid;
+                                fq.push(nf_idx);
+                            }
+                        }
+                    }
+                }
+                comp_sizes.push_back(sz);
+                if (sz > max_comp_sz) max_comp_sz = sz;
+            }
+
+            if (comp_sizes.size() > 1 && max_comp_sz > 100) {
+                std::vector<uint32_t> filtered_tris;
+                std::vector<uint16_t> filtered_mats;
+                filtered_tris.reserve(clean_tris.size());
+                if (!clean_mats.empty()) filtered_mats.reserve(clean_mats.size());
+                for (uint32_t f = 0; f < clean_nt; ++f) {
+                    if (comp_sizes[f_comp[f]] >= 25) {
+                        filtered_tris.push_back(clean_tris[3 * f + 0]);
+                        filtered_tris.push_back(clean_tris[3 * f + 1]);
+                        filtered_tris.push_back(clean_tris[3 * f + 2]);
+                        if (f < clean_mats.size()) filtered_mats.push_back(clean_mats[f]);
+                    }
+                }
+                clean_tris = std::move(filtered_tris);
+                clean_mats = std::move(filtered_mats);
+            }
+        }
+    }
+
     triangles = std::move(clean_tris);
     materials = std::move(clean_mats);
     return !triangles.empty();

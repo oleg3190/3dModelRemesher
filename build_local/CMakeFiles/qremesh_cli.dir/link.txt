@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/qremesh_cli.dir/cli/main.cpp.o -o qremesh_cli  -Wl,-rpath,/root/www/3dModelRemesher/build_local libqremesh_core.so 

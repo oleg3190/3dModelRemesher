@@ -50,6 +50,9 @@ public:
     std::vector<HalfEdge> halfedges;
     std::vector<Edge> edges;
     std::vector<Face> faces;
+    mutable std::unordered_map<uint64_t, uint32_t> edge_lut;
+
+    void rebuild_edge_lut() const;
 
     HalfEdgeMesh() = default;
 

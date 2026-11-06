@@ -64,19 +64,119 @@ void Stage6Optimize::cleanup_topology(QuadMeshResult& qmesh) {
         }
     }
 
+    std::vector<bool> poly_deleted(qmesh.polygons.size(), false);
+
+    // Identify open-boundary vertices so we NEVER delete them as doublets
+    std::vector<bool> is_boundary_v(nv, false);
+    for (const auto& [key, inc] : edge_to_polys) {
+        if (inc.size() == 1) {
+            uint32_t u = static_cast<uint32_t>(key >> 32);
+            uint32_t v = static_cast<uint32_t>(key & 0xFFFFFFFF);
+            if (u < nv) is_boundary_v[u] = true;
+            if (v < nv) is_boundary_v[v] = true;
+        }
+    }
+
+    size_t nonmanifold_deleted = 0;
+    // Deduplicate faces sharing all vertices (both quads and triangles) and filter triangles overlapping quad halves
+    auto compute_poly_hash = [](const std::vector<uint32_t>& poly) -> uint64_t {
+        std::vector<uint32_t> v = poly;
+        std::sort(v.begin(), v.end());
+        uint64_t h = 1469598103934665603ULL;
+        for (uint32_t idx : v) {
+            h ^= static_cast<uint64_t>(idx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        }
+        return h;
+    };
+
+    auto compute_tri_hash = [](uint32_t a, uint32_t b, uint32_t c) -> uint64_t {
+        uint32_t v[3] = {a, b, c};
+        if (v[0] > v[1]) std::swap(v[0], v[1]);
+        if (v[1] > v[2]) std::swap(v[1], v[2]);
+        if (v[0] > v[1]) std::swap(v[0], v[1]);
+        uint64_t h = 1469598103934665603ULL;
+        for (int i = 0; i < 3; ++i) {
+            h ^= static_cast<uint64_t>(v[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        }
+        return h;
+    };
+
+    std::unordered_set<uint64_t> seen_poly_keys;
+    std::unordered_set<uint64_t> seen_tri_keys;
+
+    // Pass 1: register triangles first
+    for (size_t p = 0; p < qmesh.polygons.size(); ++p) {
+        const auto& poly = qmesh.polygons[p];
+        if (poly.size() == 3) {
+            uint64_t poly_hash = compute_poly_hash(poly);
+            uint64_t th = compute_tri_hash(poly[0], poly[1], poly[2]);
+            if (seen_poly_keys.count(poly_hash) || seen_tri_keys.count(th)) {
+                poly_deleted[p] = true;
+                nonmanifold_deleted++;
+            } else {
+                seen_poly_keys.insert(poly_hash);
+                seen_tri_keys.insert(th);
+            }
+        }
+    }
+    // Pass 2: register quads; if fan triangulation (0,1,2)+(0,2,3) collides with an existing triangle,
+    // rotate the quad by 1 vertex to switch its fan diagonal to (1,3) before deleting
+    for (size_t p = 0; p < qmesh.polygons.size(); ++p) {
+        auto& poly = qmesh.polygons[p];
+        if (poly.size() == 4) {
+            uint64_t poly_hash = compute_poly_hash(poly);
+            if (seen_poly_keys.count(poly_hash)) {
+                poly_deleted[p] = true;
+                nonmanifold_deleted++;
+                continue;
+            }
+            uint64_t th0 = compute_tri_hash(poly[0], poly[1], poly[2]);
+            uint64_t th1 = compute_tri_hash(poly[0], poly[2], poly[3]);
+            if (seen_tri_keys.count(th0) || seen_tri_keys.count(th1)) {
+                uint64_t th0_rot = compute_tri_hash(poly[1], poly[2], poly[3]);
+                uint64_t th1_rot = compute_tri_hash(poly[1], poly[3], poly[0]);
+                if (!seen_tri_keys.count(th0_rot) && !seen_tri_keys.count(th1_rot)) {
+                    std::rotate(poly.begin(), poly.begin() + 1, poly.end());
+                    th0 = th0_rot;
+                    th1 = th1_rot;
+                } else {
+                    poly_deleted[p] = true;
+                    nonmanifold_deleted++;
+                    continue;
+                }
+            }
+            seen_poly_keys.insert(poly_hash);
+            seen_tri_keys.insert(th0);
+            seen_tri_keys.insert(th1);
+        } else if (poly.size() != 3) {
+            if (poly.size() > 4) {
+                uint64_t poly_hash = compute_poly_hash(poly);
+                if (seen_poly_keys.count(poly_hash)) {
+                    poly_deleted[p] = true;
+                    nonmanifold_deleted++;
+                } else {
+                    seen_poly_keys.insert(poly_hash);
+                }
+            } else {
+                poly_deleted[p] = true;
+            }
+        }
+    }
+    std::cout << "[stage6] duplicate_faces_deleted=" << nonmanifold_deleted << std::endl;
+
     // Valence count
     std::vector<int> valence(nv, 0);
-    for (const auto& poly : qmesh.polygons) {
-        for (uint32_t v : poly) {
+    for (size_t p = 0; p < qmesh.polygons.size(); ++p) {
+        if (poly_deleted[p]) continue;
+        for (uint32_t v : qmesh.polygons[p]) {
             if (v < nv) valence[v]++;
         }
     }
 
-    // Doublet elimination: internal vertex of valence 2 shared by 2 quads.
-    // If quad 1 is (v, a, b, c) and quad 2 is (v, c, d, a), replace both with quad (a, b, c, d)
-    std::vector<bool> poly_deleted(qmesh.polygons.size(), false);
+    size_t doublet_deleted = 0;
+    // Doublet elimination: strictly interior vertex of valence 2 shared by 2 quads
     for (uint32_t v = 0; v < nv; ++v) {
-        if (valence[v] == 2) {
+        if (valence[v] == 2 && !is_boundary_v[v]) {
             std::vector<uint32_t> inc;
             for (size_t p = 0; p < qmesh.polygons.size(); ++p) {
                 if (poly_deleted[p]) continue;
@@ -90,7 +190,6 @@ void Stage6Optimize::cleanup_topology(QuadMeshResult& qmesh) {
                 const auto& poly0 = qmesh.polygons[p0];
                 const auto& poly1 = qmesh.polygons[p1];
 
-                // Find index of v in poly0
                 int idx0 = -1;
                 for (int i = 0; i < 4; ++i) {
                     if (poly0[i] == v) { idx0 = i; break; }
@@ -99,25 +198,29 @@ void Stage6Optimize::cleanup_topology(QuadMeshResult& qmesh) {
                 uint32_t b0 = poly0[(idx0 + 2) % 4];
                 uint32_t c0 = poly0[(idx0 + 3) % 4];
 
-                // Find index of v in poly1
                 int idx1 = -1;
                 for (int i = 0; i < 4; ++i) {
                     if (poly1[i] == v) { idx1 = i; break; }
                 }
 
-                // In a true doublet, poly1 shares vertices a0 and c0
                 uint32_t a1 = poly1[(idx1 + 1) % 4];
                 uint32_t d1 = poly1[(idx1 + 2) % 4];
                 uint32_t c1 = poly1[(idx1 + 3) % 4];
 
-                if ((a1 == c0 && c1 == a0) || (a1 == a0 && c1 == c0)) {
-                    // Merge into single quad (a0, b0, c0, d1)
-                    qmesh.polygons[p0] = { a0, b0, c0, d1 };
-                    poly_deleted[p1] = true;
+                if (a1 == c0 && c1 == a0 && b0 != d1) {
+                    std::vector<uint32_t> merged_q = { a0, b0, c0, d1 };
+                    uint64_t mh = compute_poly_hash(merged_q);
+                    if (!seen_poly_keys.count(mh)) {
+                        seen_poly_keys.insert(mh);
+                        qmesh.polygons[p0] = std::move(merged_q);
+                        poly_deleted[p1] = true;
+                        doublet_deleted++;
+                    }
                 }
             }
         }
     }
+    std::cout << "[stage6] doublet_deleted=" << doublet_deleted << std::endl;
 
     // Filter deleted polygons
     std::vector<std::vector<uint32_t>> clean_polys;
@@ -128,8 +231,235 @@ void Stage6Optimize::cleanup_topology(QuadMeshResult& qmesh) {
             clean_mats.push_back(p < qmesh.material_ids.size() ? qmesh.material_ids[p] : 0);
         }
     }
-    qmesh.polygons = std::move(clean_polys);
-    qmesh.material_ids = std::move(clean_mats);
+
+    // Pair adjacent triangles sharing an interior edge into quads when geometrically valid
+    std::unordered_set<uint64_t> sharp_or_seam;
+    for (const auto& e : qmesh.sharp_edges) {
+        uint32_t u = std::min(e.first, e.second), v = std::max(e.first, e.second);
+        sharp_or_seam.insert((static_cast<uint64_t>(u) << 32) | v);
+    }
+    for (const auto& e : qmesh.seam_edges) {
+        uint32_t u = std::min(e.first, e.second), v = std::max(e.first, e.second);
+        sharp_or_seam.insert((static_cast<uint64_t>(u) << 32) | v);
+    }
+
+    std::unordered_map<uint64_t, std::vector<size_t>> tri_edge_map;
+    std::unordered_map<uint64_t, int> all_edge_cnt;
+    for (size_t p = 0; p < clean_polys.size(); ++p) {
+        const auto& poly = clean_polys[p];
+        size_t n = poly.size();
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t u = poly[i], v = poly[(i + 1) % n];
+            uint64_t key = (static_cast<uint64_t>(std::min(u, v)) << 32) | std::max(u, v);
+            all_edge_cnt[key]++;
+            if (n == 3) {
+                tri_edge_map[key].push_back(p);
+            }
+        }
+    }
+
+    struct TriMergeCand {
+        float sj;
+        size_t t0, t1;
+        std::array<uint32_t, 4> q;
+    };
+    std::vector<TriMergeCand> merge_cands;
+    for (const auto& [key, tlist] : tri_edge_map) {
+        if (tlist.size() != 2 || all_edge_cnt[key] != 2 || sharp_or_seam.count(key)) continue;
+        size_t t0 = tlist[0], t1 = tlist[1];
+        if (clean_mats[t0] != clean_mats[t1]) continue;
+        const auto& p0 = clean_polys[t0];
+        const auto& p1 = clean_polys[t1];
+
+        int i0 = -1;
+        for (int i = 0; i < 3; ++i) {
+            uint32_t u = p0[i], v = p0[(i + 1) % 3];
+            uint64_t k = (static_cast<uint64_t>(std::min(u, v)) << 32) | std::max(u, v);
+            if (k == key) { i0 = i; break; }
+        }
+        int i1 = -1;
+        for (int i = 0; i < 3; ++i) {
+            uint32_t u = p1[i], v = p1[(i + 1) % 3];
+            uint64_t k = (static_cast<uint64_t>(std::min(u, v)) << 32) | std::max(u, v);
+            if (k == key) { i1 = i; break; }
+        }
+        if (i0 < 0 || i1 < 0) continue;
+
+        uint32_t a = p0[i0];
+        uint32_t b = p0[(i0 + 1) % 3];
+        uint32_t c = p0[(i0 + 2) % 3];
+        // Opposite orientation across shared edge (a, b) means p1 has directed edge (b, a)
+        if (p1[i1] != b || p1[(i1 + 1) % 3] != a) continue;
+        uint32_t d = p1[(i1 + 2) % 3];
+        if (c == d || c == a || c == b || d == a || d == b) continue;
+
+        float sj = compute_scaled_jacobian(
+            qmesh.positions[d], qmesh.positions[b], qmesh.positions[c], qmesh.positions[a]);
+        float warp = compute_warp_angle_deg(
+            qmesh.positions[d], qmesh.positions[b], qmesh.positions[c], qmesh.positions[a]);
+        uint64_t e_cd = (static_cast<uint64_t>(std::min(c, d)) << 32) | std::max(c, d);
+        if (sj > -0.20f && warp < 75.0f && all_edge_cnt.find(e_cd) == all_edge_cnt.end()) {
+            merge_cands.push_back({sj, t0, t1, {d, b, c, a}});
+        }
+    }
+
+    std::sort(merge_cands.begin(), merge_cands.end(), [](const TriMergeCand& x, const TriMergeCand& y) {
+        return x.sj > y.sj;
+    });
+
+    std::vector<bool> tri_merged(clean_polys.size(), false);
+    for (const auto& mc : merge_cands) {
+        if (tri_merged[mc.t0] || tri_merged[mc.t1]) continue;
+        std::vector<uint32_t> qvec = {mc.q[0], mc.q[1], mc.q[2], mc.q[3]};
+        uint64_t qh = compute_poly_hash(qvec);
+        if (seen_poly_keys.count(qh)) continue;
+        seen_poly_keys.insert(qh);
+        tri_merged[mc.t0] = true;
+        tri_merged[mc.t1] = true;
+        clean_polys[mc.t0] = std::move(qvec);
+    }
+
+    std::vector<std::vector<uint32_t>> final_polys;
+    std::vector<uint16_t> final_mats;
+    final_polys.reserve(clean_polys.size());
+    final_mats.reserve(clean_mats.size());
+    for (size_t p = 0; p < clean_polys.size(); ++p) {
+        if (tri_merged[p] && clean_polys[p].size() == 3) continue;
+        final_polys.push_back(std::move(clean_polys[p]));
+        final_mats.push_back(clean_mats[p]);
+    }
+
+    qmesh.polygons = std::move(final_polys);
+    qmesh.material_ids = std::move(final_mats);
+}
+
+void Stage6Optimize::fill_small_boundary_holes(
+    RemeshContext& ctx,
+    QuadMeshResult& qmesh,
+    size_t max_hole_verts
+) {
+    if (qmesh.positions.empty() || qmesh.polygons.empty()) return;
+
+    // Map undirected edge -> list of face indices
+    std::unordered_map<uint64_t, std::vector<uint32_t>> edge_to_faces;
+    for (size_t fi = 0; fi < qmesh.polygons.size(); ++fi) {
+        const auto& p = qmesh.polygons[fi];
+        size_t n = p.size();
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t u = p[i];
+            uint32_t v = p[(i + 1) % n];
+            uint64_t key = (static_cast<uint64_t>(std::min(u, v)) << 32) | std::max(u, v);
+            edge_to_faces[key].push_back(static_cast<uint32_t>(fi));
+        }
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> bnd_edges;
+    for (const auto& [key, flist] : edge_to_faces) {
+        if (flist.size() == 1) {
+            uint32_t u = static_cast<uint32_t>(key >> 32);
+            uint32_t v = static_cast<uint32_t>(key & 0xFFFFFFFF);
+            bnd_edges.emplace_back(u, v);
+        }
+    }
+
+    // Find and trace simple boundary loops
+    std::unordered_map<uint32_t, std::vector<uint32_t>> bnd_adj;
+    for (const auto& [u, v] : bnd_edges) {
+        bnd_adj[u].push_back(v);
+        bnd_adj[v].push_back(u);
+    }
+
+    std::unordered_set<uint32_t> visited_v;
+    size_t holes_filled = 0;
+
+    for (const auto& [start_v, nbrs] : bnd_adj) {
+        if (visited_v.count(start_v) || nbrs.size() != 2) continue;
+
+        std::vector<uint32_t> loop;
+        uint32_t curr = start_v;
+        uint32_t prev = INVALID_INDEX;
+        bool is_simple_loop = true;
+
+        while (true) {
+            visited_v.insert(curr);
+            loop.push_back(curr);
+            const auto& cur_nbrs = bnd_adj[curr];
+            if (cur_nbrs.size() != 2) {
+                is_simple_loop = false;
+                break;
+            }
+            uint32_t nxt = (cur_nbrs[0] == prev) ? cur_nbrs[1] : cur_nbrs[0];
+            if (nxt == start_v) {
+                break; // Closed loop found!
+            }
+            if (visited_v.count(nxt)) {
+                is_simple_loop = false;
+                break;
+            }
+            prev = curr;
+            curr = nxt;
+            if (loop.size() > max_hole_verts) {
+                is_simple_loop = false;
+                break;
+            }
+        }
+
+        if (is_simple_loop && loop.size() >= 3 && loop.size() <= max_hole_verts) {
+            // Compute average neighbor normal to ensure correct winding
+            Vec3f avg_normal = Vec3f::Zero();
+            for (uint32_t lv : loop) {
+                uint32_t nbr_v = bnd_adj[lv][0];
+                uint64_t k = (static_cast<uint64_t>(std::min(lv, nbr_v)) << 32) | std::max(lv, nbr_v);
+                auto it = edge_to_faces.find(k);
+                if (it != edge_to_faces.end()) {
+                    for (uint32_t fi : it->second) {
+                        const auto& poly = qmesh.polygons[fi];
+                        if (poly.size() >= 3) {
+                            Vec3f fn = (qmesh.positions[poly[1]] - qmesh.positions[poly[0]]).cross(qmesh.positions[poly[2]] - qmesh.positions[poly[0]]);
+                            if (fn.norm() > 1e-6f) avg_normal += fn.normalized();
+                        }
+                    }
+                }
+            }
+            if (avg_normal.norm() < 1e-6f) avg_normal = Vec3f(0.0f, 0.0f, 1.0f);
+            else avg_normal.normalize();
+
+            auto add_hole_face = [&](std::vector<uint32_t> f_verts) {
+                if (f_verts.size() < 3) return;
+                Vec3f fn = (qmesh.positions[f_verts[1]] - qmesh.positions[f_verts[0]]).cross(qmesh.positions[f_verts[2]] - qmesh.positions[f_verts[0]]);
+                if (fn.dot(avg_normal) < 0.0f) {
+                    std::reverse(f_verts.begin(), f_verts.end());
+                }
+                qmesh.polygons.push_back(std::move(f_verts));
+                qmesh.material_ids.push_back(0);
+                holes_filled++;
+            };
+
+            if (loop.size() == 3) {
+                add_hole_face({loop[0], loop[1], loop[2]});
+            } else if (loop.size() == 4) {
+                add_hole_face({loop[0], loop[1], loop[2], loop[3]});
+            } else {
+                // Centroid fan
+                Vec3f c = Vec3f::Zero();
+                for (uint32_t lv : loop) c += qmesh.positions[lv];
+                c /= static_cast<float>(loop.size());
+                Vec3f cp, cn;
+                float d2;
+                if (ctx.original_bvh.closest_point(c, cp, cn, d2)) c = cp;
+                uint32_t c_idx = static_cast<uint32_t>(qmesh.positions.size());
+                qmesh.positions.push_back(c);
+                size_t L = loop.size();
+                for (size_t k = 0; k + 1 < L; k += 2) {
+                    add_hole_face({loop[k], loop[k + 1], loop[(k + 2) % L], c_idx});
+                }
+                if (L % 2 == 1) {
+                    add_hole_face({loop[L - 1], loop[0], c_idx});
+                }
+            }
+        }
+    }
+    std::cout << "[stage6] small boundary holes filled: " << holes_filled << std::endl;
 }
 
 void Stage6Optimize::tangential_taubin_smoothing(
@@ -204,68 +534,60 @@ void Stage6Optimize::tangential_taubin_smoothing(
         std::sort(sharp_nbrs[v].begin(), sharp_nbrs[v].end());
     }
 
-    constexpr float lambda = 0.33f;
-    constexpr float mu = -0.34f;
+    constexpr float step_factor = 0.45f;
     float max_dev = ctx.params->max_surface_deviation * 0.01f * ctx.bbox_diag;
-    float shape_w = clampf(ctx.params->shape_preservation, 0.0f, 1.0f);
+    int effective_iters = std::max(iters + 3, 8);
 
-    for (int iter = 0; iter < iters; ++iter) {
-        for (float step_factor : { lambda, mu }) {
-            std::vector<Vec3f> new_positions = qmesh.positions;
+    for (int iter = 0; iter < effective_iters; ++iter) {
+        std::vector<Vec3f> new_positions = qmesh.positions;
 
-            tbb::parallel_for(tbb::blocked_range<uint32_t>(0, nv), [&](const tbb::blocked_range<uint32_t>& r) {
-                for (uint32_t v = r.begin(); v != r.end(); ++v) {
-                    // If corner (>= 3 sharp edges), keep fixed
-                    if (sharp_deg[v] >= 3) continue;
+        tbb::parallel_for(tbb::blocked_range<uint32_t>(0, nv), [&](const tbb::blocked_range<uint32_t>& r) {
+            for (uint32_t v = r.begin(); v != r.end(); ++v) {
+                if (sharp_deg[v] >= 3) continue;
 
-                    if (sharp_deg[v] == 2) {
-                        // Feature curve: slide only along 1D curve
-                        uint32_t na = sharp_nbrs[v][0];
-                        uint32_t nb = sharp_nbrs[v][1];
-                        Vec3f curve_mid = (qmesh.positions[na] + qmesh.positions[nb]) * 0.5f;
-                        Vec3f shift = curve_mid - qmesh.positions[v];
-                        Vec3f curve_dir = (qmesh.positions[nb] - qmesh.positions[na]).normalized();
-                        Vec3f tangent_shift = shift.dot(curve_dir) * curve_dir;
-                        new_positions[v] += step_factor * tangent_shift;
-                    } else if (sharp_deg[v] == 0 && !adj[v].empty()) {
-                        // Surface vertex: tangential Taubin
-                        Vec3f centroid = Vec3f::Zero();
-                        for (uint32_t nbr : adj[v]) centroid += qmesh.positions[nbr];
-                        centroid /= static_cast<float>(adj[v].size());
+                if (sharp_deg[v] == 2) {
+                    uint32_t na = sharp_nbrs[v][0];
+                    uint32_t nb = sharp_nbrs[v][1];
+                    Vec3f curve_mid = (qmesh.positions[na] + qmesh.positions[nb]) * 0.5f;
+                    Vec3f shift = curve_mid - qmesh.positions[v];
+                    Vec3f curve_dir = (qmesh.positions[nb] - qmesh.positions[na]).normalized();
+                    Vec3f tangent_shift = shift.dot(curve_dir) * curve_dir;
+                    new_positions[v] += step_factor * tangent_shift;
+                } else if (!adj[v].empty()) {
+                    Vec3f centroid = Vec3f::Zero();
+                    for (uint32_t nbr : adj[v]) centroid += qmesh.positions[nbr];
+                    centroid /= static_cast<float>(adj[v].size());
 
-                        Vec3f shift = centroid - qmesh.positions[v];
+                    Vec3f shift = centroid - qmesh.positions[v];
 
-                        // Project onto tangent plane
-                        Vec3f normal, closest_orig;
-                        float d2;
-                        if (ctx.original_bvh.closest_point(qmesh.positions[v], closest_orig, normal, d2)) {
-                            Vec3f tan_shift = shift - shift.dot(normal) * normal;
-                            new_positions[v] += step_factor * tan_shift;
-                        }
+                    Vec3f normal, closest_orig;
+                    float d2;
+                    if (ctx.original_bvh.closest_point(qmesh.positions[v], closest_orig, normal, d2)) {
+                        Vec3f tan_shift = shift - shift.dot(normal) * normal;
+                        new_positions[v] += step_factor * tan_shift;
                     }
                 }
-            });
+            }
+        });
 
-            // Project to BVH with shape_preservation weight and deviation clamping in parallel
-            tbb::parallel_for(tbb::blocked_range<uint32_t>(0, nv), [&](const tbb::blocked_range<uint32_t>& r) {
-                for (uint32_t v = r.begin(); v != r.end(); ++v) {
-                    if (sharp_deg[v] >= 3) continue;
-                    Vec3f cp, norm;
-                    float dist_sq;
-                    if (ctx.original_bvh.closest_point(new_positions[v], cp, norm, dist_sq)) {
-                        Vec3f blended = shape_w * cp + (1.0f - shape_w) * new_positions[v];
-                        float dist = (blended - cp).norm();
-                        if (dist > max_dev && dist > 1e-6f) {
-                            new_positions[v] = cp + (blended - cp) * (max_dev / dist);
-                        } else {
-                            new_positions[v] = blended;
-                        }
+        // Project to original surface
+        tbb::parallel_for(tbb::blocked_range<uint32_t>(0, nv), [&](const tbb::blocked_range<uint32_t>& r) {
+            for (uint32_t v = r.begin(); v != r.end(); ++v) {
+                if (sharp_deg[v] >= 3) continue;
+                Vec3f cp, norm;
+                float dist_sq;
+                if (ctx.original_bvh.closest_point(new_positions[v], cp, norm, dist_sq)) {
+                    float dist = (new_positions[v] - cp).norm();
+                    if (dist > max_dev && dist > 1e-6f) {
+                        new_positions[v] = cp + (new_positions[v] - cp) * (max_dev / dist);
+                    } else {
+                        new_positions[v] = cp;
                     }
                 }
-            });
+            }
+        });
 
-            qmesh.positions = std::move(new_positions);
-        }
+        qmesh.positions = std::move(new_positions);
     }
 }
 
@@ -273,7 +595,59 @@ void Stage6Optimize::untangle_low_jacobians(
     RemeshContext& ctx,
     QuadMeshResult& qmesh
 ) {
-    constexpr int MAX_PASSES = 5;
+    constexpr int MAX_PASSES = 16;
+
+    std::vector<std::vector<size_t>> v_to_quads(qmesh.positions.size());
+    for (size_t qi = 0; qi < qmesh.polygons.size(); ++qi) {
+        if (qmesh.polygons[qi].size() == 4) {
+            for (uint32_t v : qmesh.polygons[qi]) {
+                if (v < v_to_quads.size()) v_to_quads[v].push_back(qi);
+            }
+        }
+    }
+
+    auto compute_quad_aspect = [](const Vec3f& p0, const Vec3f& p1, const Vec3f& p2, const Vec3f& p3) -> float {
+        float l0 = (p1 - p0).norm();
+        float l1 = (p2 - p1).norm();
+        float l2 = (p3 - p2).norm();
+        float l3 = (p0 - p3).norm();
+        float lmax = std::max({l0, l1, l2, l3});
+        float lmin = std::min({l0, l1, l2, l3});
+        return (lmin > 1e-8f) ? (lmax / lmin) : 1000.0f;
+    };
+
+    auto compute_quad_combined_quality = [&](const Vec3f& p0, const Vec3f& p1, const Vec3f& p2, const Vec3f& p3) -> float {
+        float sj = compute_scaled_jacobian(p0, p1, p2, p3);
+        float ar = compute_quad_aspect(p0, p1, p2, p3);
+        if (sj <= 0.0f) {
+            return sj - 0.005f * std::min(ar, 100.0f);
+        }
+        return sj / (1.0f + 0.45f * std::max(0.0f, ar - 1.15f));
+    };
+
+    auto eval_incident_quality = [&](uint32_t vid, float& out_min_sj, float& out_min_q, float& out_avg_q) -> float {
+        out_min_q = 1.0f;
+        out_min_sj = 1.0f;
+        out_avg_q = 1.0f;
+        if (vid >= v_to_quads.size() || v_to_quads[vid].empty()) return 1.0f;
+        float sum_q = 0.0f;
+        for (size_t qi : v_to_quads[vid]) {
+            const auto& q = qmesh.polygons[qi];
+            float sj = compute_scaled_jacobian(
+                qmesh.positions[q[0]], qmesh.positions[q[1]],
+                qmesh.positions[q[2]], qmesh.positions[q[3]]
+            );
+            float qval = compute_quad_combined_quality(
+                qmesh.positions[q[0]], qmesh.positions[q[1]],
+                qmesh.positions[q[2]], qmesh.positions[q[3]]
+            );
+            out_min_sj = std::min(out_min_sj, sj);
+            out_min_q = std::min(out_min_q, qval);
+            sum_q += qval;
+        }
+        out_avg_q = sum_q / static_cast<float>(v_to_quads[vid].size());
+        return 0.45f * out_min_q + 0.55f * out_avg_q;
+    };
 
     for (int pass = 0; pass < MAX_PASSES; ++pass) {
         bool fixed_any = false;
@@ -281,30 +655,118 @@ void Stage6Optimize::untangle_low_jacobians(
         for (auto& poly : qmesh.polygons) {
             if (poly.size() != 4) continue;
 
-            float j = compute_scaled_jacobian(
-                qmesh.positions[poly[0]],
-                qmesh.positions[poly[1]],
-                qmesh.positions[poly[2]],
-                qmesh.positions[poly[3]]
-            );
+            const Vec3f& p0 = qmesh.positions[poly[0]];
+            const Vec3f& p1 = qmesh.positions[poly[1]];
+            const Vec3f& p2 = qmesh.positions[poly[2]];
+            const Vec3f& p3 = qmesh.positions[poly[3]];
 
-            if (j < 0.20f) {
-                // Untangle by moving corners slightly towards diamond/parallelogram configuration
-                Vec3f c = (qmesh.positions[poly[0]] + qmesh.positions[poly[1]] +
-                           qmesh.positions[poly[2]] + qmesh.positions[poly[3]]) * 0.25f;
+            float j = compute_scaled_jacobian(p0, p1, p2, p3);
+            float ar = compute_quad_aspect(p0, p1, p2, p3);
+
+            if (j < 0.78f || ar > 1.35f) {
+                Vec3f c = (p0 + p1 + p2 + p3) * 0.25f;
+
+                Vec3f normal = Vec3f(0.0f, 0.0f, 1.0f);
+                Vec3f cp;
+                float d2;
+                if (ctx.original_bvh.closest_point(c, cp, normal, d2)) {
+                    c = cp;
+                }
+                Vec3f q_norm = (p2 - p0).cross(p3 - p1);
+                if (q_norm.squaredNorm() > 1e-12f) {
+                    Vec3f qn = q_norm.normalized();
+                    if (qn.dot(normal) < 0.0f) normal = -normal;
+                    normal = (normal + qn).normalized();
+                }
+
+                // 1) Procrustes orthogonal frame aligned with quad edges
+                Vec3f u_vec = (p1 - p0) + (p2 - p3);
+                Vec3f v_vec = (p3 - p0) + (p2 - p1);
+                u_vec -= u_vec.dot(normal) * normal;
+                v_vec -= v_vec.dot(normal) * normal;
+
+                Vec3f u_sym = u_vec + v_vec.cross(normal);
+                if (u_sym.squaredNorm() < 1e-10f) {
+                    Vec3f d1_raw = (p2 - p0) - (p2 - p0).dot(normal) * normal;
+                    if (d1_raw.squaredNorm() < 1e-10f) continue;
+                    u_sym = d1_raw.normalized();
+                } else {
+                    u_sym.normalize();
+                }
+                Vec3f v_sym = normal.cross(u_sym).normalized();
+
+                float l0 = (p1 - p0).norm();
+                float l1 = (p2 - p1).norm();
+                float l2 = (p3 - p2).norm();
+                float l3 = (p0 - p3).norm();
+                float h = 0.125f * (l0 + l1 + l2 + l3);
+
+                Vec3f proc_pts[4] = {
+                    c - h * u_sym - h * v_sym,
+                    c + h * u_sym - h * v_sym,
+                    c + h * u_sym + h * v_sym,
+                    c - h * u_sym + h * v_sym
+                };
+
+                // 2) Diagonal-aligned untangling square (robust for folded / negative-SJ quads)
+                Vec3f d1_raw = (p2 - p0) - (p2 - p0).dot(normal) * normal;
+                Vec3f diag1 = (d1_raw.squaredNorm() > 1e-10f) ? d1_raw.normalized() : (u_sym + v_sym).normalized();
+                Vec3f diag2 = normal.cross(diag1).normalized();
+                if ((p3 - p1).dot(diag2) < 0.0f) diag2 = -diag2;
+                float r1 = 0.5f * (p2 - p0).norm();
+                float r2 = 0.5f * (p3 - p1).norm();
+                float avg_r = 0.5f * (r1 + r2);
+                Vec3f diag_pts[4] = {
+                    c - avg_r * diag1,
+                    c - avg_r * diag2,
+                    c + avg_r * diag1,
+                    c + avg_r * diag2
+                };
 
                 for (int i = 0; i < 4; ++i) {
-                    Vec3f opp = qmesh.positions[poly[(i + 2) % 4]];
-                    Vec3f ideal = 2.0f * c - opp;
-                    qmesh.positions[poly[i]] = 0.8f * qmesh.positions[poly[i]] + 0.2f * ideal;
+                    uint32_t vid = poly[i];
+                    float before_sj = 1.0f, before_min_q = 1.0f, before_avg_q = 1.0f;
+                    float before_score = eval_incident_quality(vid, before_sj, before_min_q, before_avg_q);
+                    Vec3f orig_p = qmesh.positions[vid];
 
-                    Vec3f cp, n;
-                    float d2;
-                    if (ctx.original_bvh.closest_point(qmesh.positions[poly[i]], cp, n, d2)) {
-                        qmesh.positions[poly[i]] = cp;
+                    bool accepted = false;
+                    const Vec3f targets[2] = { proc_pts[i], diag_pts[i] };
+                    int num_targets = (j < 0.35f || before_sj < 0.25f) ? 2 : 1;
+
+                    for (int ti = 0; ti < num_targets && !accepted; ++ti) {
+                        for (float alpha : {0.38f, 0.20f, 0.10f}) {
+                            Vec3f cand_p = (1.0f - alpha) * orig_p + alpha * targets[ti];
+                            Vec3f proj_p, n;
+                            float d2_proj;
+                            if (ctx.original_bvh.closest_point(cand_p, proj_p, n, d2_proj)) {
+                                cand_p = proj_p;
+                            }
+
+                            qmesh.positions[vid] = cand_p;
+                            float after_sj = 1.0f, after_min_q = 1.0f, after_avg_q = 1.0f;
+                            float after_score = eval_incident_quality(vid, after_sj, after_min_q, after_avg_q);
+
+                            bool move_ok = false;
+                            if (before_sj < 0.22f) {
+                                // Strict untangling mode: prioritize raising the minimum Scaled Jacobian
+                                move_ok = (after_sj > before_sj + 1e-4f) ||
+                                          (after_sj >= before_sj - 1e-4f && after_min_q > before_min_q + 1e-4f);
+                            } else {
+                                bool sj_ok = (after_sj >= 0.22f);
+                                bool min_q_ok = (after_min_q >= std::min(before_min_q - 0.015f, 0.25f));
+                                move_ok = (after_score > before_score + 1e-4f && sj_ok && min_q_ok);
+                            }
+
+                            if (move_ok) {
+                                fixed_any = true;
+                                accepted = true;
+                                break;
+                            } else {
+                                qmesh.positions[vid] = orig_p;
+                            }
+                        }
                     }
                 }
-                fixed_any = true;
             }
         }
 
@@ -562,9 +1024,163 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
         return QRM_ERR_CANCELLED;
     }
 
+    fill_small_boundary_holes(ctx, qmesh, 20);
     cleanup_topology(qmesh);
     tangential_taubin_smoothing(ctx, qmesh, ctx.params->vertex_relax_iters);
+    cleanup_topology(qmesh);
     untangle_low_jacobians(ctx, qmesh);
+
+    // Final exact-position weld & manifold/degenerate face sanitizer
+    {
+        struct PosKey {
+            int64_t x, y, z;
+            bool operator==(const PosKey& o) const { return x == o.x && y == o.y && z == o.z; }
+        };
+        struct PosKeyHash {
+            size_t operator()(const PosKey& k) const {
+                size_t h = static_cast<size_t>(k.x) * 73856093ULL;
+                h ^= static_cast<size_t>(k.y) * 19349663ULL;
+                h ^= static_cast<size_t>(k.z) * 83492791ULL;
+                return h;
+            }
+        };
+        std::unordered_map<PosKey, uint32_t, PosKeyHash> pos_to_vid;
+        std::vector<uint32_t> v_remap(qmesh.positions.size());
+        for (size_t i = 0; i < qmesh.positions.size(); ++i) {
+            const Vec3f& p = qmesh.positions[i];
+            PosKey k{
+                static_cast<int64_t>(std::llround(static_cast<double>(p.x()) * 1e7)),
+                static_cast<int64_t>(std::llround(static_cast<double>(p.y()) * 1e7)),
+                static_cast<int64_t>(std::llround(static_cast<double>(p.z()) * 1e7))
+            };
+            auto it = pos_to_vid.find(k);
+            if (it == pos_to_vid.end()) {
+                pos_to_vid[k] = static_cast<uint32_t>(i);
+                v_remap[i] = static_cast<uint32_t>(i);
+            } else {
+                v_remap[i] = it->second;
+            }
+        }
+
+        auto tri_area = [&](uint32_t a, uint32_t b, uint32_t c) -> double {
+            Eigen::Vector3d pa = qmesh.positions[a].cast<double>();
+            Eigen::Vector3d pb = qmesh.positions[b].cast<double>();
+            Eigen::Vector3d pc = qmesh.positions[c].cast<double>();
+            return 0.5 * (pb - pa).cross(pc - pa).norm();
+        };
+
+        auto compute_tri_hash = [](uint32_t a, uint32_t b, uint32_t c) -> uint64_t {
+            uint32_t v[3] = {a, b, c};
+            if (v[0] > v[1]) std::swap(v[0], v[1]);
+            if (v[1] > v[2]) std::swap(v[1], v[2]);
+            if (v[0] > v[1]) std::swap(v[0], v[1]);
+            uint64_t h = 1469598103934665603ULL;
+            for (int i = 0; i < 3; ++i) {
+                h ^= static_cast<uint64_t>(v[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            }
+            return h;
+        };
+
+        std::vector<std::vector<uint32_t>> valid_polys;
+        std::vector<uint16_t> valid_mats;
+        valid_polys.reserve(qmesh.polygons.size());
+        valid_mats.reserve(qmesh.material_ids.size());
+
+        for (size_t pi = 0; pi < qmesh.polygons.size(); ++pi) {
+            std::vector<uint32_t> p;
+            for (uint32_t v : qmesh.polygons[pi]) {
+                uint32_t rv = v_remap[v];
+                if (p.empty() || p.back() != rv) p.push_back(rv);
+            }
+            while (p.size() > 1 && p.front() == p.back()) p.pop_back();
+            if (p.size() == 4) {
+                if (p[0] == p[2] || p[1] == p[3]) continue;
+                if (tri_area(p[0], p[1], p[2]) < 1e-13 || tri_area(p[0], p[2], p[3]) < 1e-13) {
+                    if (tri_area(p[1], p[2], p[3]) >= 1e-13 && tri_area(p[1], p[3], p[0]) >= 1e-13) {
+                        std::rotate(p.begin(), p.begin() + 1, p.end());
+                    } else {
+                        continue;
+                    }
+                }
+            } else if (p.size() == 3) {
+                if (tri_area(p[0], p[1], p[2]) < 1e-13) continue;
+            } else {
+                continue;
+            }
+            valid_polys.push_back(std::move(p));
+            valid_mats.push_back(pi < qmesh.material_ids.size() ? qmesh.material_ids[pi] : 0);
+        }
+
+        // Remove non-manifold faces (edge count > 2) and fan-triangulation duplicates
+        std::vector<bool> drop(valid_polys.size(), false);
+        std::unordered_set<uint64_t> seen_tris;
+        for (size_t pi = 0; pi < valid_polys.size(); ++pi) {
+            if (valid_polys[pi].size() == 3) {
+                uint64_t th = compute_tri_hash(valid_polys[pi][0], valid_polys[pi][1], valid_polys[pi][2]);
+                if (seen_tris.count(th)) drop[pi] = true;
+                else seen_tris.insert(th);
+            }
+        }
+        for (size_t pi = 0; pi < valid_polys.size(); ++pi) {
+            auto& p = valid_polys[pi];
+            if (p.size() == 4) {
+                uint64_t th0 = compute_tri_hash(p[0], p[1], p[2]);
+                uint64_t th1 = compute_tri_hash(p[0], p[2], p[3]);
+                if (seen_tris.count(th0) || seen_tris.count(th1)) {
+                    uint64_t th0_r = compute_tri_hash(p[1], p[2], p[3]);
+                    uint64_t th1_r = compute_tri_hash(p[1], p[3], p[0]);
+                    if (!seen_tris.count(th0_r) && !seen_tris.count(th1_r) &&
+                        tri_area(p[1], p[2], p[3]) >= 1e-13 && tri_area(p[1], p[3], p[0]) >= 1e-13) {
+                        std::rotate(p.begin(), p.begin() + 1, p.end());
+                        th0 = th0_r;
+                        th1 = th1_r;
+                    } else {
+                        drop[pi] = true;
+                        continue;
+                    }
+                }
+                seen_tris.insert(th0);
+                seen_tris.insert(th1);
+            }
+        }
+
+        std::unordered_map<uint64_t, std::vector<size_t>> edge_faces;
+        for (size_t pi = 0; pi < valid_polys.size(); ++pi) {
+            if (drop[pi]) continue;
+            const auto& p = valid_polys[pi];
+            for (size_t i = 0; i < p.size(); ++i) {
+                uint32_t u = p[i], v = p[(i + 1) % p.size()];
+                uint64_t k = (static_cast<uint64_t>(std::min(u, v)) << 32) | std::max(u, v);
+                edge_faces[k].push_back(pi);
+            }
+        }
+        for (const auto& [k, flist] : edge_faces) {
+            if (flist.size() > 2) {
+                std::vector<size_t> active;
+                for (size_t fi : flist) if (!drop[fi]) active.push_back(fi);
+                while (active.size() > 2) {
+                    // Prefer dropping triangles or smallest-area face
+                    size_t worst_idx = 0;
+                    for (size_t i = 1; i < active.size(); ++i) {
+                        if (valid_polys[active[i]].size() < valid_polys[active[worst_idx]].size()) {
+                            worst_idx = i;
+                        }
+                    }
+                    drop[active[worst_idx]] = true;
+                    active.erase(active.begin() + worst_idx);
+                }
+            }
+        }
+
+        qmesh.polygons.clear();
+        qmesh.material_ids.clear();
+        for (size_t pi = 0; pi < valid_polys.size(); ++pi) {
+            if (!drop[pi]) {
+                qmesh.polygons.push_back(std::move(valid_polys[pi]));
+                qmesh.material_ids.push_back(valid_mats[pi]);
+            }
+        }
+    }
 
     if (ctx.active_symmetry_axis >= 0 && ctx.active_symmetry_axis <= 2) {
         float tol = ctx.params->symmetry_tolerance * 0.01f * ctx.bbox_diag;

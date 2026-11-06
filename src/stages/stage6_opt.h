@@ -19,6 +19,12 @@ public:
 private:
     static void cleanup_topology(QuadMeshResult& qmesh);
 
+    static void fill_small_boundary_holes(
+        RemeshContext& ctx,
+        QuadMeshResult& qmesh,
+        size_t max_hole_verts = 16
+    );
+
     static void tangential_taubin_smoothing(
         RemeshContext& ctx,
         QuadMeshResult& qmesh,

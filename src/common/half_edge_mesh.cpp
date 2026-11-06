@@ -103,6 +103,7 @@ bool HalfEdgeMesh::build_from_triangles(
         }
     }
 
+    rebuild_edge_lut();
     return true;
 }
 
@@ -362,13 +363,28 @@ float HalfEdgeMesh::compute_total_surface_area() const {
     return total;
 }
 
+void HalfEdgeMesh::rebuild_edge_lut() const {
+    edge_lut.clear();
+    edge_lut.reserve(edges.size() * 2);
+    for (size_t e = 0; e < edges.size(); ++e) {
+        if (edges[e].is_deleted) continue;
+        uint32_t h0 = edges[e].halfedge;
+        if (h0 == INVALID_INDEX || halfedges[h0].is_deleted) continue;
+        uint32_t u = from_vertex(h0);
+        uint32_t v = halfedges[h0].to_vertex;
+        uint64_t key = (static_cast<uint64_t>(std::min(u, v)) << 32) | std::max(u, v);
+        edge_lut[key] = static_cast<uint32_t>(e);
+    }
+}
+
 uint32_t HalfEdgeMesh::find_edge(uint32_t v0, uint32_t v1) const {
     if (!is_valid_vertex(v0) || !is_valid_vertex(v1)) return INVALID_INDEX;
-    for (uint32_t h : get_vertex_outgoing_halfedges(v0)) {
-        if (halfedges[h].to_vertex == v1) {
-            return halfedges[h].edge;
-        }
+    if (edge_lut.empty() && !edges.empty()) {
+        rebuild_edge_lut();
     }
+    uint64_t key = (static_cast<uint64_t>(std::min(v0, v1)) << 32) | std::max(v0, v1);
+    auto it = edge_lut.find(key);
+    if (it != edge_lut.end()) return it->second;
     return INVALID_INDEX;
 }
 
@@ -443,6 +459,7 @@ uint32_t HalfEdgeMesh::split_edge(uint32_t e, const Vec3f& new_pt) {
         set_seam_edge(new_v, v);
     }
 
+    edge_lut.clear();
     return new_v;
 }
 
@@ -594,12 +611,17 @@ bool HalfEdgeMesh::collapse_edge(uint32_t e, const Vec3f& target_pt) {
     if (h1 != INVALID_INDEX) halfedges[h1].is_deleted = true;
 
     vertices[v0].is_deleted = true;
-    // Find any valid outgoing halfedge for v1
+    // Find any valid outgoing halfedge for v1 from its surviving faces
     vertices[v1].halfedge = INVALID_INDEX;
-    for (uint32_t h = 0; h < halfedges.size(); ++h) {
-        if (!halfedges[h].is_deleted && from_vertex(h) == v1) {
-            vertices[v1].halfedge = h;
-            break;
+    for (uint32_t f : get_vertex_faces(v1)) {
+        if (is_valid_face(f)) {
+            for (uint32_t h : get_face_halfedges(f)) {
+                if (from_vertex(h) == v1) {
+                    vertices[v1].halfedge = h;
+                    break;
+                }
+            }
+            if (vertices[v1].halfedge != INVALID_INDEX) break;
         }
     }
     return true;
@@ -664,8 +686,62 @@ void HalfEdgeMesh::compact() {
     edges.clear();
     faces.clear();
 
+    faces.resize(f_loops.size());
+    std::unordered_map<std::pair<uint32_t, uint32_t>, uint32_t, DirectedEdgeHash> edge_map;
+
     for (size_t f = 0; f < f_loops.size(); ++f) {
-        add_face(f_loops[f], mat_ids[f]);
+        faces[f].material_id = mat_ids[f];
+        faces[f].is_deleted = false;
+
+        const auto& loop = f_loops[f];
+        size_t n = loop.size();
+        uint32_t base_h = static_cast<uint32_t>(halfedges.size());
+        halfedges.resize(base_h + n);
+        faces[f].halfedge = base_h;
+
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t cur_h = base_h + static_cast<uint32_t>(i);
+            uint32_t next_h = base_h + static_cast<uint32_t>((i + 1) % n);
+            uint32_t prev_h = base_h + static_cast<uint32_t>((i + n - 1) % n);
+            uint32_t cur_v = loop[i];
+            uint32_t next_v = loop[(i + 1) % n];
+
+            halfedges[cur_h].to_vertex = next_v;
+            halfedges[cur_h].face = static_cast<uint32_t>(f);
+            halfedges[cur_h].next = next_h;
+            halfedges[cur_h].prev = prev_h;
+            halfedges[cur_h].twin = INVALID_INDEX;
+            halfedges[cur_h].edge = INVALID_INDEX;
+            halfedges[cur_h].is_deleted = false;
+
+            if (vertices[cur_v].halfedge == INVALID_INDEX) {
+                vertices[cur_v].halfedge = cur_h;
+            }
+
+            edge_map[{cur_v, next_v}] = cur_h;
+        }
+    }
+
+    // Resolve twins and create edges
+    for (size_t h = 0; h < halfedges.size(); ++h) {
+        if (halfedges[h].is_deleted || halfedges[h].twin != INVALID_INDEX) continue;
+        uint32_t u = from_vertex(static_cast<uint32_t>(h));
+        uint32_t v = halfedges[h].to_vertex;
+
+        auto it = edge_map.find({v, u});
+        uint32_t twin_h = (it != edge_map.end()) ? it->second : INVALID_INDEX;
+
+        uint32_t edge_idx = static_cast<uint32_t>(edges.size());
+        edges.emplace_back();
+        edges[edge_idx].halfedge = static_cast<uint32_t>(h);
+
+        halfedges[h].edge = edge_idx;
+        halfedges[h].twin = twin_h;
+
+        if (twin_h != INVALID_INDEX) {
+            halfedges[twin_h].twin = static_cast<uint32_t>(h);
+            halfedges[twin_h].edge = edge_idx;
+        }
     }
 
     // Restore edge attributes

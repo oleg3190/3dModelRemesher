@@ -32,6 +32,7 @@ struct OrientedEdgeRef {
 struct QuasiQuadPatch {
     uint32_t patch_id = 0;
     std::vector<OrientedEdgeRef> boundary_loop; // ordered sequence of canonical edge paths forming CCW outer boundary
+    std::array<size_t, 4> corner_indices = {0, 1, 2, 3}; // indices into boundary_loop of the 4 corners
     std::vector<uint32_t> member_faces;         // faces in working_mesh inside patch
     uint16_t material_id = 0;
     Vec3f avg_normal = Vec3f(0.0f, 0.0f, 1.0f);

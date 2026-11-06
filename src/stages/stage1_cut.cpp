@@ -177,7 +177,7 @@ void Stage1FeatureCut::project_and_embed_curves(HalfEdgeMesh& mesh, const Remesh
 }
 
 void Stage1FeatureCut::filter_micro_features(HalfEdgeMesh& mesh, float min_feature_len) {
-    // Find sharp vertices degree in sharp edge subgraph
+    // 1. Find sharp vertices degree in sharp edge subgraph
     std::vector<int> sharp_deg(mesh.vertices.size(), 0);
     std::vector<std::vector<uint32_t>> sharp_adj(mesh.vertices.size());
 
@@ -194,17 +194,9 @@ void Stage1FeatureCut::filter_micro_features(HalfEdgeMesh& mesh, float min_featu
         }
     }
 
-    // Mark corner vertices (sharp valences >= 3)
-    for (size_t v = 0; v < mesh.vertices.size(); ++v) {
-        if (sharp_deg[v] >= 3) {
-            mesh.vertices[v].is_corner = true;
-        }
-    }
-
-    // Prune branches starting at degree 1 (dead ends) shorter than min_feature_len
+    // 2. Prune dead-end branches starting at degree 1 shorter than min_feature_len
     for (size_t v = 0; v < mesh.vertices.size(); ++v) {
         if (sharp_deg[v] == 1) {
-            // Walk branch
             uint32_t curr_v = static_cast<uint32_t>(v);
             uint32_t prev_e = INVALID_INDEX;
             float branch_len = 0.0f;
@@ -242,6 +234,30 @@ void Stage1FeatureCut::filter_micro_features(HalfEdgeMesh& mesh, float min_featu
             }
         }
     }
+
+    // 3. Recompute vertex sharp & corner flags strictly after branch pruning
+    for (size_t v = 0; v < mesh.vertices.size(); ++v) {
+        mesh.vertices[v].is_sharp = false;
+        mesh.vertices[v].is_corner = false;
+    }
+    sharp_deg.assign(mesh.vertices.size(), 0);
+    for (size_t e = 0; e < mesh.edges.size(); ++e) {
+        if (!mesh.is_valid_edge(static_cast<uint32_t>(e))) continue;
+        if (mesh.edges[e].is_sharp) {
+            uint32_t h = mesh.edges[e].halfedge;
+            uint32_t u = mesh.from_vertex(h);
+            uint32_t v = mesh.halfedges[h].to_vertex;
+            sharp_deg[u]++;
+            sharp_deg[v]++;
+            mesh.vertices[u].is_sharp = true;
+            mesh.vertices[v].is_sharp = true;
+        }
+    }
+    for (size_t v = 0; v < mesh.vertices.size(); ++v) {
+        if (sharp_deg[v] >= 3) {
+            mesh.vertices[v].is_corner = true;
+        }
+    }
 }
 
 QrmStatus Stage1FeatureCut::execute(RemeshContext& ctx) {
@@ -263,7 +279,7 @@ QrmStatus Stage1FeatureCut::execute(RemeshContext& ctx) {
     project_and_embed_curves(ctx.working_mesh, ctx);
 
     // 4. Filter micro-features
-    filter_micro_features(ctx.working_mesh, 0.5f * ctx.base_target_length);
+    filter_micro_features(ctx.working_mesh, 1.5f * ctx.base_target_length);
 
     ctx.dump_stage_obj("stage1_cut", ctx.working_mesh);
     return QRM_OK;

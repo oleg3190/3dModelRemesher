@@ -1,0 +1,5 @@
+/root/www/3dModelRemesher/build_local/CMakeFiles/qremesh_core.dir
+/root/www/3dModelRemesher/build_local/CMakeFiles/qremesh_core_static.dir
+/root/www/3dModelRemesher/build_local/CMakeFiles/qremesh_cli.dir
+/root/www/3dModelRemesher/build_local/CMakeFiles/edit_cache.dir
+/root/www/3dModelRemesher/build_local/CMakeFiles/rebuild_cache.dir
