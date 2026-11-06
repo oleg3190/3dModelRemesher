@@ -516,11 +516,24 @@ void Stage0Prep::simplify_qem(HalfEdgeMesh& mesh, uint32_t target_face_count) {
         if (mesh.edges[cand.edge_idx].is_sharp || mesh.edges[cand.edge_idx].is_seam) continue;
 
         uint32_t h = mesh.edges[cand.edge_idx].halfedge;
+        if (!mesh.is_valid_halfedge(h)) continue;
         uint32_t u = mesh.from_vertex(h);
         uint32_t v = mesh.halfedges[h].to_vertex;
 
         if (mesh.collapse_edge(cand.edge_idx, cand.best_pt)) {
-            cur_faces -= 2;
+            // cur_faces drift guard: a collapse removes 0..2 faces depending on
+            // boundary/non-manifold context; subtracting a fixed 2 undercounts and lets
+            // the loop run past the live face count, then dereference a deleted halfedge
+            // (segfault on dense inputs). Re-count live faces periodically.
+            static int rc_ctr = 0;
+            if ((++rc_ctr & 0xFF) == 0) {
+                uint32_t live = 0;
+                for (uint32_t f = 0; f < (uint32_t)mesh.faces.size(); ++f)
+                    if (mesh.is_valid_face(f)) ++live;
+                cur_faces = live;
+            } else if (cur_faces >= 2) {
+                cur_faces -= 2;
+            }
 
             // Merge quadric to surviving vertex v
             v_quadrics[v].A += v_quadrics[u].A;
@@ -789,11 +802,18 @@ QrmStatus Stage0Prep::execute(RemeshContext& ctx) {
     }
 
     // Step 5: QEM proxy if triangle count > threshold
-    if (ctx.working_mesh.faces.size() > ctx.params->proxy_tri_threshold) {
+    // proxy_tri_threshold is overridable via QREMESH_PROXY_THRESHOLD for testing dense
+    // inputs (and to skip the decimation entirely by setting it very high).
+    long proxy_thr = static_cast<long>(ctx.params->proxy_tri_threshold);
+    if (const char* e = std::getenv("QREMESH_PROXY_THRESHOLD")) {
+        long v = std::atol(e);
+        if (v > 0) proxy_thr = v;
+    }
+    if (static_cast<long>(ctx.working_mesh.faces.size()) > proxy_thr) {
         if (!ctx.notify_progress(0.08f, "Stage 0: QEM Decimation Proxy")) {
             return QRM_ERR_CANCELLED;
         }
-        simplify_qem(ctx.working_mesh, 250000);
+        simplify_qem(ctx.working_mesh, static_cast<uint32_t>(proxy_thr));
     }
 
     // Step 6: Symmetry slice if requested (0=X, 1=Y, 2=Z, 3=Auto-detect)
