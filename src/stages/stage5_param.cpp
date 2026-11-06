@@ -229,6 +229,47 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
         detect_four_corners(patch);
     }
 
+    // ---- S30: are patches rectangular? the grid skew (angle dev 49deg) is inherited from
+    // the CUT corners. Measure the turn angle between the two border sides at each of the
+    // 4 grid corners. ~90deg -> grid lines can be orthogonal; far from 90 -> every interior
+    // Laplacian inherits the slant and no re-cutting can fix it (explains S26/S29 plateau).
+    {
+        std::vector<float> corner_dev;
+        for (const auto& patch : graph.patches) {
+            size_t M = patch.boundary_loop.size();
+            if (M < 4) continue;
+            for (int ci = 0; ci < 4; ++ci) {
+                size_t k = patch.corner_indices[ci];
+                const auto& ep_prev = graph.edge_paths[patch.boundary_loop[(k + M - 1) % M].edge_path_id];
+                const auto& ep_curr = graph.edge_paths[patch.boundary_loop[k].edge_path_id];
+                auto endpt = [&](const CanonicalEdgePath& e, bool first_end) {
+                    size_t idx = first_end ? (e.path_vertices.empty()?0:e.path_vertices.size()-1) : 0;
+                    return mesh.vertices[e.path_vertices[idx]].pos;
+                };
+                // incoming direction into the corner, outgoing out of it
+                Vec3f in_d = endpt(ep_prev, true) - endpt(ep_prev, false);
+                Vec3f out_d = endpt(ep_curr, false) - endpt(ep_curr, true);
+                // orient: in_d points toward corner along prev path end; keep as is
+                float il = in_d.norm(), ol = out_d.norm();
+                if (il < 1e-6f || ol < 1e-6f) continue;
+                float dot = clampf(in_d.dot(out_d) / (il * ol), -1.0f, 1.0f);
+                // angle BETWEEN the two sides as seen from the corner is 180 - turn
+                float ang = std::acos(dot) * 180.0f / PI_F;
+                corner_dev.push_back(std::abs(ang - 90.0f));
+            }
+        }
+        if (!corner_dev.empty()) {
+            std::sort(corner_dev.begin(), corner_dev.end());
+            float med = corner_dev[corner_dev.size() / 2];
+            size_t gt30 = 0, gt45 = 0;
+            for (float a : corner_dev) { if (a > 30) gt30++; if (a > 45) gt45++; }
+            std::cout << "[stage5/corners] n=" << corner_dev.size()
+                      << " median_dev90=" << med
+                      << " >30deg=" << (100.0 * gt30 / corner_dev.size())
+                      << "% >45deg=" << (100.0 * gt45 / corner_dev.size()) << "%" << std::endl;
+        }
+    }
+
     // 3. Binary search for optimal h matching target quad count
     std::vector<int> d_test(num_edges);
     auto evaluate_total_quads = [&](float h) -> int64_t {
@@ -1117,6 +1158,7 @@ void Stage5ParamAndExtract::extract_patch_quads(
         int v = std::atoi(e);
         if (v >= 0) harmonic_iters = v;
     }
+    const bool snap_final_only = std::getenv("QREMESH_SNAP_FINAL") != nullptr;  // S30 theory
     for (int it = 0; it < harmonic_iters; ++it) {
         for (int i = 1; i < nu; ++i) {
             for (int j = 1; j < nv; ++j) {
@@ -1126,10 +1168,28 @@ void Stage5ParamAndExtract::extract_patch_quads(
                             out_quads.positions[grid[i][j + 1]];
                 avg *= 0.25f;
                 Vec3f p = avg;            // weight 1: full step to the neighbour mean
+                if (!snap_final_only) {
+                    Vec3f cp, cn;
+                    float d2;
+                    if (ctx.original_bvh.closest_point(p, cp, cn, d2)) p = cp;  // snap (no shrink)
+                }
+                out_quads.positions[grid[i][j]] = p;   // Gauss-Seidel: apply immediately
+            }
+        }
+    }
+    // Theory 2: relax the grid in free 3D space (chordal Laplacian orthogonalizes the net,
+    // since the patch corners are ~90 deg per [stage5/corners]), THEN project every node to
+    // the source ONCE. Per-iteration snapping (old behaviour) pulls each node back onto the
+    // curved sheet every step, which UNDOES the orthogonalization on curved patches - that is
+    // why 100 iterations plateaued WORSE than 16. One final snap keeps fidelity but lets the
+    // interior actually square up.
+    if (snap_final_only) {
+        for (int i = 1; i < nu; ++i) {
+            for (int j = 1; j < nv; ++j) {
                 Vec3f cp, cn;
                 float d2;
-                if (ctx.original_bvh.closest_point(p, cp, cn, d2)) p = cp;  // snap (no shrink)
-                out_quads.positions[grid[i][j]] = p;   // Gauss-Seidel: apply immediately
+                if (ctx.original_bvh.closest_point(out_quads.positions[grid[i][j]], cp, cn, d2))
+                    out_quads.positions[grid[i][j]] = cp;
             }
         }
     }
