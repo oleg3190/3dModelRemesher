@@ -806,6 +806,17 @@ void Stage4PatchGraph::build_quasi_quad_patches(
     }
 
     std::vector<bool> is_junction(mesh.vertices.size(), false);
+    // Stop nodes for canonical path tracing - STRICTLY the real T-nodes of the patch
+    // partition (three or more different patch_ids meet in the one-ring) plus places where
+    // the cut graph crosses the model's OPEN border. Any other border vertex has exactly
+    // two patches around it and degree 2 in the face-based border graph, so a path passes
+    // through it unambiguously. (Stopping at micro branch points, as the old cut_deg-based
+    // rule did, shreds the cut graph into pieces finer than one quad cell; every path costs
+    // at least one border sample, N >= #paths, and the quad grid explodes - that was the
+    // root of the 374k-polygon run.) Passing a two-patch vertex keeps "one path = one
+    // patch pair", so stitching is unaffected.
+    std::vector<bool> is_true_stop = is_junction;
+    size_t stop_three_patch = 0, stop_open_cross = 0;
     for (size_t v = 0; v < mesh.vertices.size(); ++v) {
         if (cut_deg[v] == 0) continue;
         std::unordered_set<int> distinct_p;
@@ -814,10 +825,27 @@ void Stage4PatchGraph::build_quasi_quad_patches(
                 distinct_p.insert(face_patch[f]);
             }
         }
-        if (cut_deg[v] != 2 || distinct_p.size() >= 3) {
+        bool touches_open = false;
+        for (uint32_t nbr : cut_nbrs[v]) {
+            uint32_t e = mesh.find_edge(static_cast<uint32_t>(v), nbr);
+            if (e != INVALID_INDEX && mesh.is_boundary_edge(e)) {
+                touches_open = true;
+                break;
+            }
+        }
+        if (distinct_p.size() >= 3) {
             is_junction[v] = true;
+            stop_three_patch++;
+        } else if (touches_open && cut_deg[v] != 2) {
+            // open border crossing the cut graph: the patch pair changes there
+            is_junction[v] = true;
+            stop_open_cross++;
         }
     }
+    is_true_stop = is_junction; // tracing adds synthetic starts later; collapse uses this
+    std::cout << "[stage4/junctions] stops_three_patch=" << stop_three_patch
+              << " stops_open_cross=" << stop_open_cross
+              << " base_target_length=" << ctx.base_target_length << std::endl;
 
     // Guarantee that every connected component in the cut graph contains at least one junction
     {
@@ -936,14 +964,17 @@ void Stage4PatchGraph::build_quasi_quad_patches(
 
             while (curr_v != junc && !is_junction[curr_v] && ++walk_guard <= mesh.vertices.size()) {
                 uint32_t next_v = INVALID_INDEX;
+                float best_dot = -2.0f;
+                Vec3f in_dir = (mesh.vertices[curr_v].pos - mesh.vertices[prev_v].pos).normalized();
                 for (uint32_t cand : cut_nbrs[curr_v]) {
-                    if (cand != prev_v) {
-                        uint32_t cand_e = find_mesh_edge(curr_v, cand);
-                        if (cand_e != INVALID_INDEX && !edge_visited[cand_e]) {
-                            next_v = cand;
-                            break;
-                        }
-                    }
+                    if (cand == prev_v) continue;
+                    uint32_t cand_e = find_mesh_edge(curr_v, cand);
+                    if (cand_e == INVALID_INDEX || edge_visited[cand_e]) continue;
+                    // straightest continuation wins where several arcs meet at a
+                    // two-patch vertex (pair invariant holds either way)
+                    Vec3f out_dir = (mesh.vertices[cand].pos - mesh.vertices[curr_v].pos).normalized();
+                    float d = in_dir.dot(out_dir);
+                    if (d > best_dot) { best_dot = d; next_v = cand; }
                 }
                 if (next_v == INVALID_INDEX) break;
 
@@ -1016,14 +1047,15 @@ void Stage4PatchGraph::build_quasi_quad_patches(
 
         while (curr_v != junc && !is_junction[curr_v] && ++walk_guard <= mesh.vertices.size()) {
             uint32_t next_v = INVALID_INDEX;
+            float best_dot = -2.0f;
+            Vec3f in_dir = (mesh.vertices[curr_v].pos - mesh.vertices[prev_v].pos).normalized();
             for (uint32_t cand : cut_nbrs[curr_v]) {
-                if (cand != prev_v) {
-                    uint32_t cand_e = find_mesh_edge(curr_v, cand);
-                    if (cand_e != INVALID_INDEX && !edge_visited[cand_e]) {
-                        next_v = cand;
-                        break;
-                    }
-                }
+                if (cand == prev_v) continue;
+                uint32_t cand_e = find_mesh_edge(curr_v, cand);
+                if (cand_e == INVALID_INDEX || edge_visited[cand_e]) continue;
+                Vec3f out_dir = (mesh.vertices[cand].pos - mesh.vertices[curr_v].pos).normalized();
+                float d = in_dir.dot(out_dir);
+                if (d > best_dot) { best_dot = d; next_v = cand; }
             }
             if (next_v == INVALID_INDEX) break;
 
@@ -1099,107 +1131,208 @@ void Stage4PatchGraph::build_quasi_quad_patches(
         }
     }
 
-    auto find_simple_cycles = [&](const std::vector<OrientedEdgeRef>& bnd_edges) -> std::vector<std::vector<OrientedEdgeRef>> {
-        if (bnd_edges.empty()) return {};
-
-        std::unordered_map<uint32_t, std::vector<size_t>> adj;
-        for (size_t i = 0; i < bnd_edges.size(); ++i) {
-            const auto& ep = paths[bnd_edges[i].edge_path_id];
-            uint32_t u = bnd_edges[i].forward ? ep.node_start : ep.node_end;
-            adj[u].push_back(i);
-        }
-
-        std::vector<bool> used(bnd_edges.size(), false);
-        std::vector<std::vector<OrientedEdgeRef>> cycles;
-
-        for (size_t start_idx = 0; start_idx < bnd_edges.size(); ++start_idx) {
-            if (used[start_idx]) continue;
-
-            std::vector<size_t> walk;
-            std::vector<uint32_t> node_history;
-            std::unordered_map<uint32_t, size_t> node_to_walk_pos;
-
-            size_t cur_e = start_idx;
-            while (true) {
-                used[cur_e] = true;
-                walk.push_back(cur_e);
-
-                const auto& ep = paths[bnd_edges[cur_e].edge_path_id];
-                uint32_t u = bnd_edges[cur_e].forward ? ep.node_start : ep.node_end;
-                uint32_t v = bnd_edges[cur_e].forward ? ep.node_end : ep.node_start;
-
-                node_history.push_back(u);
-                node_to_walk_pos[u] = walk.size() - 1;
-
-                auto it = node_to_walk_pos.find(v);
-                if (it != node_to_walk_pos.end()) {
-                    // A simple cycle is closed from it->second to walk.size() - 1
-                    size_t c_start = it->second;
-                    std::vector<OrientedEdgeRef> cyc;
-                    for (size_t k = c_start; k < walk.size(); ++k) {
-                        cyc.push_back(bnd_edges[walk[k]]);
-                    }
-                    cycles.push_back(std::move(cyc));
-
-                    for (size_t k = c_start; k < walk.size(); ++k) {
-                        node_to_walk_pos.erase(node_history[k]);
-                    }
-                    walk.resize(c_start);
-                    node_history.resize(c_start);
-                    if (walk.empty()) break;
-                    const auto& last_ep = paths[bnd_edges[walk.back()].edge_path_id];
-                    v = bnd_edges[walk.back()].forward ? last_ep.node_end : last_ep.node_start;
-                }
-
-                size_t next_e = INVALID_INDEX;
-                auto adj_it = adj.find(v);
-                if (adj_it != adj.end()) {
-                    for (size_t cand_e : adj_it->second) {
-                        if (!used[cand_e]) {
-                            next_e = cand_e;
-                            break;
-                        }
-                    }
-                }
-
-                if (next_e == INVALID_INDEX) {
-                    break;
-                }
-                cur_e = next_e;
-            }
-        }
-        return cycles;
-    };
-
     size_t loops_missing = 0, unclosed_count = 0;
 
-    for (int p = 0; p < active_patch_count; ++p) {
-        if (patches[p].member_faces.empty() || patch_bnd_paths[p].empty()) {
-            loops_missing++;
-            continue;
+    // ---- Collapse micro-paths ---------------------------------------------------------
+    // Canonical paths shorter than a quarter cell cannot hold a quad edge; they exist only
+    // because the cut graph follows source-mesh edges. Merging them into a neighbour keeps
+    // the path count proportional to perimeter/cell instead of to the source mesh.
+    // Safety rules (pair invariant / stitching):
+    //   - merge only across NON-stop vertices (a real T-node would change the patch pair),
+    //   - only into a path with the SAME (unordered) patch pair,
+    //   - when several arcs meet there, take the straightest one (same rule as tracing).
+    // Both neighbours see the same merged path id, so their samples stay identical.
+    std::vector<bool> path_dead(paths.size(), false);
+    {
+        const float collapse_len = 0.25f * ctx.base_target_length;
+        auto pair_key = [](const CanonicalEdgePath& p) -> std::pair<int, int> {
+            int a = static_cast<int>(p.left_patch), b = static_cast<int>(p.right_patch);
+            return (a <= b) ? std::make_pair(a, b) : std::make_pair(b, a);
+        };
+        std::unordered_map<uint32_t, std::vector<uint32_t>> inc_paths; // vertex -> alive ids
+        for (size_t i = 0; i < paths.size(); ++i) {
+            inc_paths[paths[i].node_start].push_back(static_cast<uint32_t>(i));
+            inc_paths[paths[i].node_end].push_back(static_cast<uint32_t>(i));
         }
+        auto forget = [&inc_paths](uint32_t vert, uint32_t id) {
+            auto jt = inc_paths.find(vert);
+            if (jt == inc_paths.end()) return;
+            auto& vec = jt->second;
+            vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
+        };
 
-        auto cycles = find_simple_cycles(patch_bnd_paths[p]);
-        if (cycles.empty()) {
-            loops_missing++;
-            continue;
-        }
+        size_t merges = 0;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t p = 0; p < paths.size() && !changed; ++p) {
+                if (path_dead[p] || paths[p].continuous_len >= collapse_len) continue;
+                for (int end = 0; end < 2 && !changed; ++end) {
+                    uint32_t v = (end == 0) ? paths[p].node_start : paths[p].node_end;
+                    if (v < is_true_stop.size() && is_true_stop[v]) continue;
 
-        // Pick cycle with largest perimeter
-        size_t best_c = 0;
-        float best_len = -1.0f;
-        for (size_t c = 0; c < cycles.size(); ++c) {
-            float len = 0.0f;
-            for (const auto& eref : cycles[c]) {
-                len += paths[eref.edge_path_id].continuous_len;
+                    uint32_t u = (end == 0) ? paths[p].node_end : paths[p].node_start;
+                    Vec3f in_dir = (mesh.vertices[v].pos - mesh.vertices[u].pos).normalized();
+
+                    uint32_t q = INVALID_INDEX;
+                    float best_dot = -2.0f;
+                    auto it = inc_paths.find(v);
+                    if (it != inc_paths.end()) {
+                        for (uint32_t cand : it->second) {
+                            if (cand == p || path_dead[cand]) continue;
+                            if (pair_key(paths[cand]) != pair_key(paths[p])) continue;
+                            uint32_t w = (paths[cand].node_start == v) ? paths[cand].node_end
+                                                                      : paths[cand].node_start;
+                            Vec3f out_dir = (mesh.vertices[w].pos - mesh.vertices[v].pos).normalized();
+                            float d = in_dir.dot(out_dir);
+                            if (d > best_dot) { best_dot = d; q = cand; }
+                        }
+                    }
+                    if (q == INVALID_INDEX) continue;
+
+                    std::vector<uint32_t> chain = paths[p].path_vertices;
+                    if (chain.front() != v) std::reverse(chain.begin(), chain.end());
+                    std::vector<uint32_t>& qc = paths[q].path_vertices;
+                    bool q_reversed = false;
+                    if (qc.front() == v) { std::reverse(qc.begin(), qc.end()); q_reversed = true; }
+                    if (q_reversed) std::swap(paths[q].node_start, paths[q].node_end);
+                    qc.insert(qc.end(), chain.begin() + 1, chain.end()); // chain starts at v
+                    paths[q].node_end = qc.back();
+                    paths[q].continuous_len += paths[p].continuous_len;
+                    paths[q].is_sharp = paths[q].is_sharp || paths[p].is_sharp;
+                    paths[q].is_seam = paths[q].is_seam || paths[p].is_seam;
+                    paths[q].is_open_border = paths[q].is_open_border || paths[p].is_open_border;
+
+                    path_dead[p] = true;
+                    merges++;
+                    changed = true;
+                    forget(v, static_cast<uint32_t>(p));
+                    forget(v, static_cast<uint32_t>(q));
+                    inc_paths[paths[q].node_end].push_back(static_cast<uint32_t>(q));
+                    break;
+                }
             }
+        }
+        std::cout << "[stage4/collapse] merged_micro_paths=" << merges
+                  << " alive_paths=" << (paths.size() - merges) << std::endl;
+    }
+
+    // Drop collapsed paths and reindex: loops are built AFTER this point, and the only
+    // stale consumer of old ids (directed_edge_to_path, filled during tracing) is written
+    // but never read. Compacting also keeps stage5 from sampling dead paths.
+    if (std::any_of(path_dead.begin(), path_dead.end(), [](bool d) { return d; })) {
+        std::vector<CanonicalEdgePath> alive;
+        alive.reserve(paths.size());
+        for (size_t i = 0; i < paths.size(); ++i) {
+            if (!path_dead[i]) alive.push_back(std::move(paths[i]));
+        }
+        paths = std::move(alive);
+        path_dead.assign(paths.size(), false);
+    }
+
+    // Directed lookup: source halfedge (u -> v) -> packed (path_id << 1 | forward).
+    // Canonical paths are edge-disjoint, so every patch border halfedge resolves to
+    // exactly one canonical path (registered here in both directions).
+    std::unordered_map<uint64_t, uint32_t> dir_edge_path;
+    dir_edge_path.reserve(paths.size() * 8);
+    for (size_t i = 0; i < paths.size(); ++i) {
+        if (path_dead[i]) continue;
+        const auto& pv = paths[i].path_vertices;
+        for (size_t k = 0; k + 1 < pv.size(); ++k) {
+            uint32_t a = pv[k], b = pv[k + 1];
+            dir_edge_path[(static_cast<uint64_t>(a) << 32) | b] = static_cast<uint32_t>((i << 1) | 1u);
+            dir_edge_path[(static_cast<uint64_t>(b) << 32) | a] = static_cast<uint32_t>((i << 1) | 0u);
+        }
+    }
+
+    // Assemble every patch loop from its OWN face borders. The border of a face region is
+    // a closed curve, so this covers each border edge by construction. The previous
+    // path-graph cycle walker silently dropped chains (dead ends and non-largest cycles)
+    // and lost 4-8% of the border of 46-55 patches - those gaps were the holes stage6 had
+    // to cover with giant 40-208 vertex fill bands.
+    size_t chain_unresolved = 0, leftover_chains = 0;
+    for (int p = 0; p < active_patch_count; ++p) {
+        if (patches[p].member_faces.empty()) {
+            loops_missing++;
+            continue;
+        }
+        std::unordered_set<uint32_t> pf(patches[p].member_faces.begin(),
+                                        patches[p].member_faces.end());
+        std::vector<std::pair<uint32_t, uint32_t>> bedges;
+        bedges.reserve(patches[p].member_faces.size() * 2);
+        for (uint32_t f : patches[p].member_faces) {
+            for (uint32_t h : mesh.get_face_halfedges(f)) {
+                uint32_t tw = mesh.halfedges[h].twin;
+                if (tw != INVALID_INDEX && pf.count(mesh.halfedges[tw].face)) continue;
+                bedges.emplace_back(mesh.from_vertex(h), mesh.halfedges[h].to_vertex);
+            }
+        }
+        if (bedges.empty()) {
+            loops_missing++;
+            continue;
+        }
+
+        std::unordered_map<uint32_t, std::vector<size_t>> out_b;
+        out_b.reserve(bedges.size());
+        for (size_t i = 0; i < bedges.size(); ++i) out_b[bedges[i].first].push_back(i);
+
+        std::vector<bool> used(bedges.size(), false);
+        std::vector<std::vector<OrientedEdgeRef>> chains;
+        for (size_t s = 0; s < bedges.size(); ++s) {
+            if (used[s]) continue;
+            std::vector<OrientedEdgeRef> chain;
+            size_t cur = s;
+            while (true) {
+                used[cur] = true;
+                uint32_t u = bedges[cur].first;
+                uint32_t v = bedges[cur].second;
+                auto it = dir_edge_path.find((static_cast<uint64_t>(u) << 32) | v);
+                if (it == dir_edge_path.end()) {
+                    chain_unresolved++;          // should not happen: every border edge exists
+                } else {
+                    uint32_t pid = it->second >> 1;
+                    bool fwd = (it->second & 1u) != 0;
+                    // Merge consecutive source edges of the SAME path segment into ONE
+                    // loop entry. The loop must list path segments, not source edges:
+                    // stage5 concatenates samples per entry, so K entries for one path
+                    // append its samples K times and the grid explodes (that was the cause
+                    // of the 388k-polygon run, independent of divisions).
+                    if (chain.empty() || chain.back().edge_path_id != pid ||
+                        chain.back().forward != fwd) {
+                        chain.push_back({pid, fwd});
+                    }
+                }
+                size_t nxt = bedges.size();
+                auto oit = out_b.find(v);
+                if (oit != out_b.end()) {
+                    for (size_t c : oit->second) {
+                        if (!used[c]) { nxt = c; break; }
+                    }
+                }
+                if (nxt == bedges.size()) break; // chain closed / dead end
+                cur = nxt;
+            }
+            if (!chain.empty()) chains.push_back(std::move(chain));
+        }
+
+        if (chains.empty()) {
+            loops_missing++;
+            continue;
+        }
+        // A patch border can have more than one component (patch wrapping a hole); keep
+        // the longest for the quad grid, the rest stay small holes for stage6 to fill.
+        if (chains.size() > 1) leftover_chains += chains.size() - 1;
+        size_t best = 0;
+        float best_len = -1.0f;
+        for (size_t c = 0; c < chains.size(); ++c) {
+            float len = 0.0f;
+            for (const auto& eref : chains[c]) len += paths[eref.edge_path_id].continuous_len;
             if (len > best_len) {
                 best_len = len;
-                best_c = c;
+                best = c;
             }
         }
-
-        patches[p].boundary_loop = std::move(cycles[best_c]);
+        patches[p].boundary_loop = std::move(chains[best]);
     }
 
     // Ensure every patch boundary loop with >= 4 mesh vertices has at least 4 canonical paths
@@ -1282,6 +1415,7 @@ void Stage4PatchGraph::build_quasi_quad_patches(
         // loop - the source of unstitched borders (holes).
         size_t used_once = 0, used_once_not_open = 0, not_open_examples = 0;
         for (size_t i = 0; i < paths.size() && i < path_loop_uses.size(); ++i) {
+            if (path_dead[i]) continue;
             if (path_loop_uses[i] <= 1) {
                 used_once++;
                 if (!paths[i].is_open_border) {
@@ -1338,6 +1472,81 @@ void Stage4PatchGraph::build_quasi_quad_patches(
         }
     }
 
+    // ---- Border coverage diagnostic ------------------------------------------------
+    // Compare each patch's TRUE border (derived from its faces) with the edges actually
+    // covered by its canonical loop. Every border edge the loop misses becomes an
+    // unstitched hole that stage6 later covers with a giant fill band (the 40-208 vertex
+    // patches) - that is what we are hunting here.
+    {
+        auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+            return (static_cast<uint64_t>(std::min(a, b)) << 32) | std::max(a, b);
+        };
+        size_t patches_with_misses = 0, total_missed = 0, missed_open = 0, total_border = 0;
+        size_t missed_traced = 0, missed_untraced = 0;
+        std::vector<std::pair<size_t, uint32_t>> worst; // (missed, patch id)
+        // union of ALL canonical paths: a missed border edge that appears here exists as a
+        // path but was lost when assembling THIS patch's loop; if it is absent here, the
+        // edge never became a canonical path at all.
+        std::unordered_set<uint64_t> global_cov;
+        for (const auto& cpath : paths) {
+            for (size_t k = 0; k + 1 < cpath.path_vertices.size(); ++k) {
+                global_cov.insert(ekey(cpath.path_vertices[k], cpath.path_vertices[k + 1]));
+            }
+        }
+        for (int p = 0; p < active_patch_count; ++p) {
+            if (patches[p].member_faces.empty()) continue;
+            std::unordered_set<uint32_t> pf(patches[p].member_faces.begin(),
+                                            patches[p].member_faces.end());
+            std::unordered_set<uint64_t> covered;
+            for (const auto& eref : patches[p].boundary_loop) {
+                if (eref.edge_path_id >= paths.size()) continue;
+                const auto& pv = paths[eref.edge_path_id].path_vertices;
+                for (size_t k = 0; k + 1 < pv.size(); ++k) {
+                    covered.insert(ekey(pv[k], pv[k + 1]));
+                }
+            }
+            size_t border = 0, missed = 0, missed_o = 0;
+            for (uint32_t f : patches[p].member_faces) {
+                for (uint32_t h : mesh.get_face_halfedges(f)) {
+                    uint32_t tw = mesh.halfedges[h].twin;
+                    if (tw != INVALID_INDEX && pf.count(mesh.halfedges[tw].face)) continue;
+                    border++;
+                    uint32_t a = mesh.from_vertex(h);
+                    uint32_t b = mesh.halfedges[h].to_vertex;
+                    if (!covered.count(ekey(a, b))) {
+                        missed++;
+                        if (global_cov.count(ekey(a, b))) missed_traced++;
+                        else missed_untraced++;
+                        if (mesh.is_boundary_edge(mesh.halfedges[h].edge)) missed_o++;
+                    }
+                }
+            }
+            total_border += border;
+            if (missed) {
+                patches_with_misses++;
+                total_missed += missed;
+                missed_open += missed_o;
+                worst.push_back({missed, static_cast<uint32_t>(p)});
+            }
+        }
+        std::sort(worst.begin(), worst.end(),
+                  [](const std::pair<size_t, uint32_t>& x, const std::pair<size_t, uint32_t>& y) {
+                      return x.first > y.first;
+                  });
+        std::cout << "[stage4/border] patches_with_misses=" << patches_with_misses
+                  << " missed_edges=" << total_missed << "/" << total_border
+                  << " (on_open_border=" << missed_open
+                  << ", exists_as_path=" << missed_traced
+                  << ", no_path_at_all=" << missed_untraced << ")" << std::endl;
+        for (size_t i = 0; i < worst.size() && i < 6; ++i) {
+            uint32_t p = worst[i].second;
+            std::cout << "    [stage4/border] patch " << p
+                      << " missed=" << worst[i].first
+                      << " loop=" << patches[p].boundary_loop.size()
+                      << " faces=" << patches[p].member_faces.size() << std::endl;
+        }
+    }
+
     std::map<size_t, size_t> loop_size_hist;
     for (int p = 0; p < active_patch_count; ++p) {
         loop_size_hist[patches[p].boundary_loop.size()]++;
@@ -1352,6 +1561,8 @@ void Stage4PatchGraph::build_quasi_quad_patches(
               << " canonical_paths=" << paths.size()
               << " patches=" << active_patch_count
               << " patches_without_loop=" << loops_missing
+              << " chain_unresolved=" << chain_unresolved
+              << " leftover_chains=" << leftover_chains
               << " unclosed_loops=" << unclosed_count
               << std::endl;
 

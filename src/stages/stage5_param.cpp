@@ -65,7 +65,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     float h_initial = (ctx.params->target_edge_length > 0.0f) ? ctx.params->target_edge_length : ctx.base_target_length;
     if (target <= 0) {
         for (size_t i = 0; i < num_edges; ++i) {
-            graph.edge_paths[i].integer_divisions = std::clamp(static_cast<int>(std::round(path_metric_len[i] / h_initial)), 1, 100);
+            graph.edge_paths[i].integer_divisions = std::clamp(static_cast<int>(std::round(path_metric_len[i] / h_initial)), 0, 100);
         }
         return;
     }
@@ -232,7 +232,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     std::vector<int> d_test(num_edges);
     auto evaluate_total_quads = [&](float h) -> int64_t {
         for (size_t e = 0; e < num_edges; ++e) {
-            d_test[e] = std::clamp(static_cast<int>(std::round(path_metric_len[e] / h)), 1, 100);
+            d_test[e] = std::clamp(static_cast<int>(std::round(path_metric_len[e] / h)), 0, 100);
         }
         int64_t total = 0;
         for (size_t p = 0; p < num_patches; ++p) {
@@ -249,10 +249,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
             for (size_t k = 0; k < M; ++k) {
                 N += d_test[patch.boundary_loop[k].edge_path_id];
             }
-            if (N < 4) {
-                total += 1;
-                continue;
-            }
+            if (N < 4) N = 4;   // mirrors the "at least 4 samples" guarantee before parity
             int64_t i2 = N / 2;
             int64_t i1 = N / 4;
             {
@@ -367,7 +364,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     // Initial unconstrained divisions
     Eigen::VectorXd d0(num_edges);
     for (size_t e = 0; e < num_edges; ++e) {
-        d0[e] = std::clamp(static_cast<double>(std::round(path_metric_len[e] / best_h)), 1.0, 100.0);
+        d0[e] = std::clamp(static_cast<double>(std::round(path_metric_len[e] / best_h)), 0.0, 100.0);
     }
 
     // Solve (A * A^T + 1e-4 * I) * lambda = A * d0
@@ -649,6 +646,42 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
         graph.edge_paths[e].integer_divisions = d_int[e];
     }
 
+    // A patch loop needs at least 4 samples for the sample-level 4-corner split. When
+    // micro-path collapse and zero divisions leave a loop with fewer, hand the missing
+    // divisions to the LONGEST paths of that loop only: a patch side must never sum to 0,
+    // but raising every path back to >= 1 would restore the N >= #paths floor that caused
+    // the polygon explosion.
+    {
+        bool boosted = true;
+        int guard = 0;
+        while (boosted && guard++ < 8) {
+            boosted = false;
+            for (const auto& patch : graph.patches) {
+                if (patch.boundary_loop.size() < 2) continue;
+                int64_t total = 0;
+                for (const auto& eref : patch.boundary_loop) {
+                    if (eref.edge_path_id < num_edges) {
+                        total += graph.edge_paths[eref.edge_path_id].integer_divisions;
+                    }
+                }
+                if (total >= 4) continue;
+                uint32_t best = INVALID_INDEX;
+                float best_len = -1.0f;
+                for (const auto& eref : patch.boundary_loop) {
+                    if (eref.edge_path_id >= num_edges) continue;
+                    const auto& ep = graph.edge_paths[eref.edge_path_id];
+                    if (ep.continuous_len > best_len) {
+                        best_len = ep.continuous_len;
+                        best = eref.edge_path_id;
+                    }
+                }
+                if (best == INVALID_INDEX) break;
+                graph.edge_paths[best].integer_divisions += 1;
+                boosted = true;
+            }
+        }
+    }
+
     // (Sliver loops with < 4 paths are intentionally NOT special-cased here: bumping their
     //  divisions produced isolated islands - the patch across such a path does not carry
     //  that path in its own loop, so the extra samples cannot stitch anything together.)
@@ -731,6 +764,17 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
         }
         std::cout << "[stage5/parity] flips=" << flips
                   << " unsolvable_patches=" << unsolvable << std::endl;
+    }
+
+    {
+        size_t d0c = 0, d1c = 0, d23c = 0, dgt = 0, dmax = 0;
+        for (size_t e = 0; e < num_edges; ++e) {
+            int d = graph.edge_paths[e].integer_divisions;
+            if (d == 0) d0c++; else if (d == 1) d1c++; else if (d <= 3) d23c++; else dgt++;
+            if (static_cast<size_t>(d) > dmax) dmax = static_cast<size_t>(d);
+        }
+        std::cout << "[stage5/divs] zero=" << d0c << " one=" << d1c
+                  << " two_three=" << d23c << " gt3=" << dgt << " max=" << dmax << std::endl;
     }
 
     for (size_t p = 0; p < num_patches; ++p) {
@@ -1217,7 +1261,14 @@ QrmStatus Stage5ParamAndExtract::execute(
     // 2. Canonical arc-length sampling for every path in graph.edge_paths
     for (auto& ep : graph.edge_paths) {
         int M = ep.integer_divisions;
-        if (M <= 0) M = 1;
+        if (M <= 0) {
+            // Shorter than half a cell: this path contributes NO samples at all. Both
+            // neighbours of the path see the same zero, so the seam stays identical, and
+            // together with the micro-path collapse in stage4 this is what finally breaks
+            // N >= #paths per patch loop (the source of the polygon explosion).
+            ep.out_sample_vertices.clear();
+            continue;
+        }
         ep.out_sample_vertices.resize(M + 1);
         ep.out_sample_vertices[0] = junc_to_out[ep.node_start];
         ep.out_sample_vertices[M] = junc_to_out[ep.node_end];
