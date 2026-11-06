@@ -1483,6 +1483,54 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
         }
     }
 
+    // T6 (S38): drop disconnected island SHELLS from the final quad mesh. In quality mode
+    // (keep-best-2 removes sliver bridges) a self-touching AI surface separates into the
+    // main shell + a few islands (tiny dust at low budget; a larger lobe at high). Keep
+    // components whose face count is >= max(abs_floor, ratio * largest) and drop the rest; a
+    // genuinely multi-part model keeps its real parts (they are large), dust disappears.
+    // Runs BEFORE the quality report so reported boundary/components reflect the result.
+    // Env QREMESH_DROP_ISLANDS (abs floor 50 quads default, ratio 0.01; QREMESH_ISLAND_*).
+    if (std::getenv("QREMESH_DROP_ISLANDS")) {
+        size_t nq = qmesh.polygons.size();
+        std::unordered_map<uint64_t, uint32_t> edge2face;  // undirected edge -> a face
+        std::vector<uint32_t> par(nq);
+        for (size_t i = 0; i < nq; ++i) par[i] = (uint32_t)i;
+        std::function<uint32_t(uint32_t)> find = [&](uint32_t x) {
+            while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x;
+        };
+        auto uni = [&](uint32_t a, uint32_t b) { a = find(a); b = find(b); if (a != b) par[a] = b; };
+        for (uint32_t f = 0; f < nq; ++f) {
+            const auto& p = qmesh.polygons[f];
+            size_t pn = p.size();
+            for (size_t i = 0; i < pn; ++i) {
+                uint32_t a = p[i], b = p[(i + 1) % pn];
+                uint64_t key = (uint64_t(std::min(a,b)) << 32) | std::max(a,b);
+                auto it = edge2face.find(key);
+                if (it == edge2face.end()) edge2face[key] = f;
+                else uni(it->second, f);
+            }
+        }
+        std::unordered_map<uint32_t, uint32_t> csz; uint32_t largest = 0;
+        for (uint32_t f = 0; f < nq; ++f) { uint32_t r = find(f); uint32_t s = ++csz[r]; if (s > largest) largest = s; }
+        float iratio = 0.01f;
+        if (const char* e = std::getenv("QREMESH_ISLAND_RATIO")) { float r = std::atof(e); if (r > 0) iratio = r; }
+        uint32_t ifloor = 50;
+        if (const char* e = std::getenv("QREMESH_ISLAND_FLOOR")) { long r = std::atol(e); if (r >= 0) ifloor = (uint32_t)r; }
+        uint32_t thresh = std::max(ifloor, (uint32_t)(iratio * largest));
+        std::vector<std::vector<uint32_t>> keep_polys;
+        std::vector<uint16_t> keep_mats;
+        keep_polys.reserve(nq);
+        uint32_t dropped = 0;
+        for (uint32_t f = 0; f < nq; ++f) {
+            if (csz[find(f)] >= thresh) { keep_polys.push_back(std::move(qmesh.polygons[f])); if (f < qmesh.material_ids.size()) keep_mats.push_back(qmesh.material_ids[f]); }
+            else dropped++;
+        }
+        qmesh.polygons = std::move(keep_polys);
+        qmesh.material_ids = std::move(keep_mats);
+        std::cout << "[stage6/islands] kept=" << qmesh.polygons.size() << " dropped=" << dropped
+                  << " thresh=" << thresh << " largest=" << largest << std::endl;
+    }
+
     compute_final_quality_report(ctx, qmesh);
 
     ctx.dump_quads_obj("stage6_optimized", qmesh);
