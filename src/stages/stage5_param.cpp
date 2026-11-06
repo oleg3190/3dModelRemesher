@@ -402,11 +402,18 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
 
     std::mt19937 rng(ctx.params->random_seed ? ctx.params->random_seed : 42u);
     std::normal_distribution<double> noise(0.0, 0.35);
-    constexpr int NUM_RESTARTS = 32;
+    // Opposite-side equalities are satisfied BY CONSTRUCTION now (sample-level corners
+    // with i2 = N/2), so enforcing them again in the integer solve only distorts the metric
+    // densities: it raised the achievable quad-count floor (targets below ~1500 were
+    // unreachable) and skewed cells. Keep the raw metric rounding unless explicitly
+    // re-enabled for debugging.
+    constexpr bool kEnforceSideEqualities = false;
+    constexpr int NUM_RESTARTS = kEnforceSideEqualities ? 32 : 1;
 
     for (int restart = 0; restart < NUM_RESTARTS; ++restart) {
     for (size_t e = 0; e < num_edges; ++e) {
-        double v = d_cont[e] + ((restart == 0) ? 0.0 : noise(rng));
+        double base = kEnforceSideEqualities ? d_cont[e] : d0[e];
+        double v = base + ((restart == 0) ? 0.0 : noise(rng));
         d_int[e] = std::clamp(static_cast<int>(std::round(v)), 1, 100);
     }
 
@@ -420,7 +427,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     E_res = 0;
     for (int val : r) E_res += static_cast<int64_t>(val) * val;
 
-    for (int iter = 0; iter < 1500 && E_res > 0; ++iter) {
+    for (int iter = 0; kEnforceSideEqualities && iter < 1500 && E_res > 0; ++iter) {
         int best_e = -1;
         int best_delta = 0;
         int64_t best_dE_res = 0;
@@ -475,7 +482,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
         int sum_delta = 0;
     };
 
-    for (int pass = 0; pass < 60 && E_res > 0; ++pass) {
+    for (int pass = 0; kEnforceSideEqualities && pass < 60 && E_res > 0; ++pass) {
         bool any_augmented = false;
         for (size_t r_start = 0; r_start < num_rows; ++r_start) {
             while (r[r_start] != 0) {
@@ -665,7 +672,11 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
             for (const auto& eref : patch.boundary_loop) {
                 uint32_t e = eref.edge_path_id;
                 if (e >= n_paths) continue;
-                N += graph.edge_paths[e].integer_divisions;
+                int d = graph.edge_paths[e].integer_divisions;
+                N += d;
+                // Any path may be flipped; patches that stay odd afterwards are fixed
+                // locally by duplicating one sample in extract_patch_quads.
+                (void)d;
                 row.bits[e >> 6] ^= (1ull << (e & 63));
             }
             row.b = static_cast<uint8_t>(N & 1); // odd number of flips -> N becomes even
