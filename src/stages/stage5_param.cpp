@@ -22,6 +22,8 @@ struct ExtractStats {
     size_t sum_quads = 0;
     size_t sum_nu = 0;
     size_t sum_nv = 0;
+    size_t mismatch_patches = 0;   // opposite sides with different sample counts
+    size_t degenerate_slots = 0;   // border grid slots mapping to the same vertex
     void reset() { *this = ExtractStats{}; }
 };
 ExtractStats g_extract_stats;
@@ -71,15 +73,18 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     }
 
     // 2. Detect 4 geometric corners for each patch and rotate boundary_loop so Corner 0 is at index 0
-    auto detect_four_corners = [&](QuasiQuadPatch& patch) {
+    //    When d_opt is given, only splits whose OPPOSITE side division sums are equal are accepted
+    //    (that is what keeps the quad grid regular: D0 == D2, D1 == D3).
+    //    Returns true when a candidate split was found and applied.
+    auto detect_four_corners = [&](QuasiQuadPatch& patch, const std::vector<int>* d_opt = nullptr) -> bool {
         size_t M = patch.boundary_loop.size();
         if (M < 4) {
             patch.corner_indices = {0, 0, 0, 0};
-            return;
+            return false;
         }
         if (M == 4) {
             patch.corner_indices = {0, 1, 2, 3};
-            return;
+            return false;
         }
 
         std::vector<float> path_lens(M);
@@ -135,12 +140,21 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
             return turn_scores[a] < turn_scores[b];
         });
 
-        size_t num_cands = std::min(M, size_t(16));
-        std::vector<size_t> top_cands(cand_indices.begin(), cand_indices.begin() + num_cands);
-        std::sort(top_cands.begin(), top_cands.end());
+        std::vector<size_t> top_cands;
+        if (d_opt && M <= 30) {
+            // Feasibility search needs the full candidate set (loops are short)
+            top_cands.resize(M);
+            for (size_t i = 0; i < M; ++i) top_cands[i] = i;
+        } else {
+            // Geometric pass keeps only the most corner-like positions
+            size_t num_cands = std::min(M, d_opt ? size_t(24) : size_t(16));
+            top_cands.assign(cand_indices.begin(), cand_indices.begin() + num_cands);
+            std::sort(top_cands.begin(), top_cands.end());
+        }
 
         float best_total_score = 1e9f;
         std::array<size_t, 4> best_corners = {0, 1, 2, 3};
+        bool found_candidate = false;
 
         size_t C = top_cands.size();
         for (size_t a = 0; a < C; ++a) {
@@ -151,6 +165,16 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
                         size_t i1 = top_cands[b];
                         size_t i2 = top_cands[c];
                         size_t i3 = top_cands[d];
+
+                        if (d_opt) {
+                            int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                            for (size_t k = i0; k < i1; ++k) s0 += (*d_opt)[patch.boundary_loop[k].edge_path_id];
+                            for (size_t k = i1; k < i2; ++k) s1 += (*d_opt)[patch.boundary_loop[k].edge_path_id];
+                            for (size_t k = i2; k < i3; ++k) s2 += (*d_opt)[patch.boundary_loop[k].edge_path_id];
+                            for (size_t k = i3; k < M; ++k)  s3 += (*d_opt)[patch.boundary_loop[k].edge_path_id];
+                            for (size_t k = 0; k < i0; ++k)  s3 += (*d_opt)[patch.boundary_loop[k].edge_path_id];
+                            if (s0 != s2 || s1 != s3 || s0 < 1 || s1 < 1) continue;
+                        }
 
                         float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
                         for (size_t k = i0; k < i1; ++k) l0 += path_lens[k];
@@ -171,11 +195,14 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
                         if (score < best_total_score) {
                             best_total_score = score;
                             best_corners = {i0, i1, i2, i3};
+                            found_candidate = true;
                         }
                     }
                 }
             }
         }
+
+        if (!found_candidate) return false;
 
         size_t c0 = best_corners[0];
         if (c0 > 0) {
@@ -186,6 +213,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
             best_corners[0] = 0;
         }
         patch.corner_indices = best_corners;
+        return true;
     };
 
     for (auto& patch : graph.patches) {
@@ -341,7 +369,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     int64_t E_res = 0;
     for (int val : r) E_res += static_cast<int64_t>(val) * val;
 
-    for (int iter = 0; iter < 500 && E_res > 0; ++iter) {
+    for (int iter = 0; iter < 4000 && E_res > 0; ++iter) {
         int best_e = -1;
         int best_delta = 0;
         int64_t best_dE = 0;
@@ -384,7 +412,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
         int sum_delta = 0;
     };
 
-    for (int pass = 0; pass < 6 && E_res > 0; ++pass) {
+    for (int pass = 0; pass < 60 && E_res > 0; ++pass) {
         bool any_augmented = false;
         for (size_t r_start = 0; r_start < num_rows; ++r_start) {
             while (r[r_start] != 0) {
@@ -487,7 +515,37 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
         if (!any_augmented) break;
     }
 
-    std::cout << "[stage5/kkt] residual_norm=" << E_res << std::endl;
+    // 5b. Patch-local corner refinement: for patches whose opposite side sums still differ,
+    //     search an alternative 4-corner split that makes both pairs exactly equal under the
+    //     solved divisions. Removes degenerate border cells without touching d_int.
+    size_t refined_patches = 0, still_mismatched = 0;
+    {
+        auto side_sums = [&](const QuasiQuadPatch& patch, int& a, int& b, int& c, int& dd) {
+            size_t M = patch.boundary_loop.size();
+            a = b = c = dd = 0;
+            size_t i0 = patch.corner_indices[0], i1 = patch.corner_indices[1];
+            size_t i2 = patch.corner_indices[2], i3 = patch.corner_indices[3];
+            for (size_t k = i0; k < i1 && k < M; ++k) a += d_int[patch.boundary_loop[k].edge_path_id];
+            for (size_t k = i1; k < i2 && k < M; ++k) b += d_int[patch.boundary_loop[k].edge_path_id];
+            for (size_t k = i2; k < i3 && k < M; ++k) c += d_int[patch.boundary_loop[k].edge_path_id];
+            for (size_t k = i3; k < M; ++k) dd += d_int[patch.boundary_loop[k].edge_path_id];
+            for (size_t k = 0; k < i0 && k < M; ++k) dd += d_int[patch.boundary_loop[k].edge_path_id];
+        };
+        for (auto& patch : graph.patches) {
+            if (patch.boundary_loop.size() < 5) continue;
+            int s0, s1, s2, s3;
+            side_sums(patch, s0, s1, s2, s3);
+            if (s0 == s2 && s1 == s3 && s0 >= 1 && s1 >= 1) continue;
+            if (detect_four_corners(patch, &d_int)) refined_patches++;
+            else still_mismatched++;
+        }
+    }
+    std::cout << "[stage5/corners] refined=" << refined_patches
+              << " still_mismatched=" << still_mismatched << std::endl;
+
+    int rows_needing_fix = 0;
+    for (int val : r) if (val != 0) rows_needing_fix++;
+    std::cout << "[stage5/kkt] residual_norm=" << E_res << " rows_needing_fix=" << rows_needing_fix << std::endl;
 
     for (size_t e = 0; e < num_edges; ++e) {
         graph.edge_paths[e].integer_divisions = d_int[e];
@@ -624,8 +682,9 @@ void Stage5ParamAndExtract::extract_patch_quads(
 
     int nu = std::max(1, static_cast<int>(std::max(D0, D2)));
     int nv = std::max(1, static_cast<int>(std::max(D1, D3)));
-    g_extract_stats.sum_nu += nu;
-    g_extract_stats.sum_nv += nv;
+    g_extract_stats.sum_nu += static_cast<size_t>(nu);
+    g_extract_stats.sum_nv += static_cast<size_t>(nv);
+    if (D0 != D2 || D1 != D3) g_extract_stats.mismatch_patches++;
 
     std::vector<std::vector<uint32_t>> grid(nu + 1, std::vector<uint32_t>(nv + 1, INVALID_INDEX));
 
@@ -644,6 +703,16 @@ void Stage5ParamAndExtract::extract_patch_quads(
     for (int j = 0; j <= nv; ++j) {
         size_t k = (D3 == static_cast<size_t>(nv)) ? (nv - j) : std::min(D3, static_cast<size_t>(std::round(static_cast<double>((nv - j) * D3) / nv)));
         grid[0][j] = side3[k];
+    }
+
+    // Degenerate border slots: two adjacent grid nodes sharing one sample vertex
+    for (int i = 0; i < nu; ++i) {
+        if (grid[i][0] == grid[i + 1][0]) g_extract_stats.degenerate_slots++;
+        if (grid[i][nv] == grid[i + 1][nv]) g_extract_stats.degenerate_slots++;
+    }
+    for (int j = 0; j < nv; ++j) {
+        if (grid[nu][j] == grid[nu][j + 1]) g_extract_stats.degenerate_slots++;
+        if (grid[0][j] == grid[0][j + 1]) g_extract_stats.degenerate_slots++;
     }
 
     // Build local patch BVH
@@ -731,6 +800,40 @@ void Stage5ParamAndExtract::extract_patch_quads(
 
     g_extract_stats.sum_interior_verts += static_cast<size_t>(std::max(0, nu - 1)) *
                                            static_cast<size_t>(std::max(0, nv - 1));
+
+    // Iron out parameterization crinkles: Jacobi passes pulling every interior grid node
+    // towards the average of its four grid neighbours, re-projected onto the source surface.
+    // Border nodes belong to the shared canonical paths and are never touched, so patch
+    // stitching is unaffected. Overlapping/folded interior cells are what shows up as
+    // wrinkles (excess surface area) on the final mesh.
+    // More passes converge the map towards a harmonic (fold-free) one.
+    for (int pass = 0; pass < 24; ++pass) {
+        std::vector<uint32_t> nodes;
+        std::vector<Vec3f> targets;
+        const size_t est = static_cast<size_t>(std::max(0, nu - 1)) *
+                           static_cast<size_t>(std::max(0, nv - 1));
+        nodes.reserve(est);
+        targets.reserve(est);
+        for (int i = 1; i < nu; ++i) {
+            for (int j = 1; j < nv; ++j) {
+                const Vec3f& cur = out_quads.positions[grid[i][j]];
+                Vec3f avg = out_quads.positions[grid[i - 1][j]] +
+                            out_quads.positions[grid[i + 1][j]] +
+                            out_quads.positions[grid[i][j - 1]] +
+                            out_quads.positions[grid[i][j + 1]];
+                avg *= 0.25f;
+                Vec3f p = cur + 0.5f * (avg - cur);
+                Vec3f cp, cn;
+                float d2;
+                if (ctx.original_bvh.closest_point(p, cp, cn, d2)) p = cp;
+                nodes.push_back(grid[i][j]);
+                targets.push_back(p);
+            }
+        }
+        for (size_t k = 0; k < nodes.size(); ++k) {
+            out_quads.positions[nodes[k]] = targets[k];
+        }
+    }
 
     for (int i = 0; i < nu; ++i) {
         for (int j = 0; j < nv; ++j) {
@@ -925,6 +1028,8 @@ QrmStatus Stage5ParamAndExtract::execute(
               << " sum_quads=" << g_extract_stats.sum_quads
               << " avg_nu=" << (graph.patches.empty() ? 0.0 : static_cast<double>(g_extract_stats.sum_nu) / graph.patches.size())
               << " avg_nv=" << (graph.patches.empty() ? 0.0 : static_cast<double>(g_extract_stats.sum_nv) / graph.patches.size())
+              << " mismatch_patches=" << g_extract_stats.mismatch_patches
+              << " degenerate_slots=" << g_extract_stats.degenerate_slots
               << std::endl;
 
     if (out_quads.polygons.empty()) {

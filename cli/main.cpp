@@ -141,6 +141,10 @@ int main(int argc, char** argv) {
         dump_dir = argv[4];
         params.debug_dump_dir = dump_dir.c_str();
     }
+    if (argc > 5) {
+        // Optional: adaptive_density override (0.0 = uniform sizing .. 1.0 = max curvature adaptivity)
+        params.adaptive_density = static_cast<float>(std::atof(argv[5]));
+    }
 
     QrmMeshOut* mesh_out = nullptr;
     QrmStatus status = qrm_remesh(&mesh_in, &params, progress_callback, nullptr, &mesh_out);

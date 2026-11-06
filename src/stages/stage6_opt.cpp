@@ -1,5 +1,6 @@
 #include "stages/stage6_opt.h"
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 #include <numeric>
@@ -534,11 +535,35 @@ void Stage6Optimize::tangential_taubin_smoothing(
         std::sort(sharp_nbrs[v].begin(), sharp_nbrs[v].end());
     }
 
-    constexpr float step_factor = 0.45f;
     float max_dev = ctx.params->max_surface_deviation * 0.01f * ctx.bbox_diag;
     int effective_iters = std::max(iters + 3, 8);
 
+    // Forward Laplacian relaxation with an ANCHOR cap: every vertex keeps its position
+    // from the start of the relaxation as an anchor and may travel at most 60% of its
+    // shortest incident edge. Without the cap the smoother slides vertices off small
+    // features (rails, brackets, rims) while staying on the source surface - erodes detail.
+    const std::vector<Vec3f> anchor = qmesh.positions;
+    std::vector<float> slide_cap(nv, 0.0f);
+    for (const auto& poly : qmesh.polygons) {
+        size_t n = poly.size();
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t u = poly[i];
+            uint32_t w = poly[(i + 1) % n];
+            if (u >= nv || w >= nv) continue;
+            float len = (anchor[u] - anchor[w]).norm();
+            if (len > 1e-9f) {
+                float c = 0.60f * len;
+                if (slide_cap[u] <= 0.0f || c < slide_cap[u]) slide_cap[u] = c;
+                if (slide_cap[w] <= 0.0f || c < slide_cap[w]) slide_cap[w] = c;
+            }
+        }
+    }
+
     for (int iter = 0; iter < effective_iters; ++iter) {
+        // Forward (lambda) step only: the mu counter-step was tried and it amplifies
+        // micro-irregularities -> the surface crinkles (area +20%) without moving off
+        // the source. The anchor cap below already protects against shrinkage/erosion.
+        const float step_factor = 0.40f;
         std::vector<Vec3f> new_positions = qmesh.positions;
 
         tbb::parallel_for(tbb::blocked_range<uint32_t>(0, nv), [&](const tbb::blocked_range<uint32_t>& r) {
@@ -570,7 +595,7 @@ void Stage6Optimize::tangential_taubin_smoothing(
             }
         });
 
-        // Project to original surface
+        // Project to original surface + anchor cap
         tbb::parallel_for(tbb::blocked_range<uint32_t>(0, nv), [&](const tbb::blocked_range<uint32_t>& r) {
             for (uint32_t v = r.begin(); v != r.end(); ++v) {
                 if (sharp_deg[v] >= 3) continue;
@@ -584,6 +609,12 @@ void Stage6Optimize::tangential_taubin_smoothing(
                         new_positions[v] = cp;
                     }
                 }
+                float cap = (v < slide_cap.size()) ? slide_cap[v] : 0.0f;
+                if (cap > 0.0f) {
+                    Vec3f delta = new_positions[v] - anchor[v];
+                    float dl = delta.norm();
+                    if (dl > cap) new_positions[v] = anchor[v] + delta * (cap / dl);
+                }
             }
         });
 
@@ -596,6 +627,27 @@ void Stage6Optimize::untangle_low_jacobians(
     QuadMeshResult& qmesh
 ) {
     constexpr int MAX_PASSES = 16;
+
+    // Anti-wrinkle guard: the untangler may only move a vertex a fraction of its shortest
+    // incident edge away from where it started. Without it, per-quad quality greedy moves
+    // let vertices migrate along the surface and the mesh inflates by ~19% (wrinkles)
+    // while every vertex still lies exactly on the source.
+    const std::vector<Vec3f> anchor = qmesh.positions;
+    std::vector<float> slide_cap(qmesh.positions.size(), 0.0f);
+    for (const auto& poly : qmesh.polygons) {
+        size_t pn = poly.size();
+        for (size_t i = 0; i < pn; ++i) {
+            uint32_t u = poly[i];
+            uint32_t w = poly[(i + 1) % pn];
+            if (u >= slide_cap.size() || w >= slide_cap.size()) continue;
+            float len = (anchor[u] - anchor[w]).norm();
+            if (len > 1e-9f) {
+                float c = 1.0f * len;  // untangle needs room for corrective slides
+                if (slide_cap[u] <= 0.0f || c < slide_cap[u]) slide_cap[u] = c;
+                if (slide_cap[w] <= 0.0f || c < slide_cap[w]) slide_cap[w] = c;
+            }
+        }
+    }
 
     std::vector<std::vector<size_t>> v_to_quads(qmesh.positions.size());
     for (size_t qi = 0; qi < qmesh.polygons.size(); ++qi) {
@@ -649,6 +701,40 @@ void Stage6Optimize::untangle_low_jacobians(
         return 0.45f * out_min_q + 0.55f * out_avg_q;
     };
 
+    auto incident_area = [&](uint32_t vid) -> float {
+        float a = 0.0f;
+        if (vid >= v_to_quads.size()) return 0.0f;
+        for (size_t qi : v_to_quads[vid]) {
+            const auto& q = qmesh.polygons[qi];
+            if (q.size() < 3 || q[0] >= qmesh.positions.size()) continue;
+            const Vec3f& a0 = qmesh.positions[q[0]];
+            for (size_t k = 1; k + 1 < q.size(); ++k) {
+                if (q[k] >= qmesh.positions.size() || q[k + 1] >= qmesh.positions.size()) continue;
+                Vec3f e1 = qmesh.positions[q[k]] - a0;
+                Vec3f e2 = qmesh.positions[q[k + 1]] - a0;
+                a += 0.5f * e1.cross(e2).norm();
+            }
+        }
+        return a;
+    };
+
+    // Global surface-area band: quality moves may neither inflate nor collapse the mesh
+    // relative to what stage 5 produced (per-move *incident* area guard was one-sided and
+    // starved the untangler, while no guard at all inflated the mesh by ~19% = wrinkles).
+    double global_area = 0.0;
+    for (const auto& poly : qmesh.polygons) {
+        if (poly.size() < 3 || poly[0] >= qmesh.positions.size()) continue;
+        const Vec3f& a0 = qmesh.positions[poly[0]];
+        for (size_t k = 1; k + 1 < poly.size(); ++k) {
+            if (poly[k] >= qmesh.positions.size() || poly[k + 1] >= qmesh.positions.size()) continue;
+            Vec3f e1 = qmesh.positions[poly[k]] - a0;
+            Vec3f e2 = qmesh.positions[poly[k + 1]] - a0;
+            global_area += 0.5 * static_cast<double>(e1.cross(e2).norm());
+        }
+    }
+    const double area_lo = 0.94 * global_area;
+    const double area_hi = 1.05 * global_area;
+
     for (int pass = 0; pass < MAX_PASSES; ++pass) {
         bool fixed_any = false;
 
@@ -663,6 +749,8 @@ void Stage6Optimize::untangle_low_jacobians(
             float j = compute_scaled_jacobian(p0, p1, p2, p3);
             float ar = compute_quad_aspect(p0, p1, p2, p3);
 
+            // Genuinely defective quads trigger repair; a per-move area guard below stops
+            // the greedy quality moves from inflating the mesh.
             if (j < 0.78f || ar > 1.35f) {
                 Vec3f c = (p0 + p1 + p2 + p3) * 0.25f;
 
@@ -727,6 +815,7 @@ void Stage6Optimize::untangle_low_jacobians(
                     uint32_t vid = poly[i];
                     float before_sj = 1.0f, before_min_q = 1.0f, before_avg_q = 1.0f;
                     float before_score = eval_incident_quality(vid, before_sj, before_min_q, before_avg_q);
+                    float before_area = incident_area(vid);
                     Vec3f orig_p = qmesh.positions[vid];
 
                     bool accepted = false;
@@ -741,10 +830,19 @@ void Stage6Optimize::untangle_low_jacobians(
                             if (ctx.original_bvh.closest_point(cand_p, proj_p, n, d2_proj)) {
                                 cand_p = proj_p;
                             }
+                            if (vid < slide_cap.size() && slide_cap[vid] > 0.0f &&
+                                (cand_p - anchor[vid]).norm() > slide_cap[vid]) {
+                                continue; // would migrate the vertex too far -> skip
+                            }
 
                             qmesh.positions[vid] = cand_p;
                             float after_sj = 1.0f, after_min_q = 1.0f, after_avg_q = 1.0f;
                             float after_score = eval_incident_quality(vid, after_sj, after_min_q, after_avg_q);
+                            // Global area band guard: the move must keep the TOTAL surface
+                            // inside [96%, 102%] of what stage 5 produced.
+                            float after_area = incident_area(vid);
+                            double projected_global = global_area - before_area + after_area;
+                            bool area_ok = (projected_global >= area_lo && projected_global <= area_hi);
 
                             bool move_ok = false;
                             if (before_sj < 0.22f) {
@@ -757,9 +855,10 @@ void Stage6Optimize::untangle_low_jacobians(
                                 move_ok = (after_score > before_score + 1e-4f && sj_ok && min_q_ok);
                             }
 
-                            if (move_ok) {
+                            if (move_ok && area_ok) {
                                 fixed_any = true;
                                 accepted = true;
+                                global_area = projected_global;
                                 break;
                             } else {
                                 qmesh.positions[vid] = orig_p;
@@ -1024,11 +1123,51 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
         return QRM_ERR_CANCELLED;
     }
 
-    fill_small_boundary_holes(ctx, qmesh, 20);
+    // Debug overrides for A/B testing of the post-process stages:
+    //   QREMESH_RELAX_ITERS=<n>  override relaxation iterations (0 disables it)
+    //   QREMESH_NO_HOLEFILL=1    skip hole filling
+    //   QREMESH_NO_UNTANGLE=1    skip the untangle pass
+    int relax_iters = ctx.params->vertex_relax_iters;
+    bool skip_holefill = false;
+    bool skip_untangle = false;
+    if (const char* env_r = std::getenv("QREMESH_RELAX_ITERS")) {
+        relax_iters = std::max(0, std::atoi(env_r));
+    }
+    if (const char* env_h = std::getenv("QREMESH_NO_HOLEFILL")) {
+        skip_holefill = (std::atoi(env_h) != 0);
+    }
+    if (const char* env_u = std::getenv("QREMESH_NO_UNTANGLE")) {
+        skip_untangle = (std::atoi(env_u) != 0);
+    }
+
+    // Surface-area timeline: shows which sub-stage inflates the mesh (wrinkles = excess area)
+    auto poly_area = [&qmesh]() {
+        double a = 0.0;
+        for (const auto& poly : qmesh.polygons) {
+            if (poly.size() < 3) continue;
+            const Vec3f& p0 = qmesh.positions[poly[0]];
+            for (size_t i = 1; i + 1 < poly.size(); ++i) {
+                Vec3f e1 = qmesh.positions[poly[i]] - p0;
+                Vec3f e2 = qmesh.positions[poly[i + 1]] - p0;
+                a += 0.5 * static_cast<double>(e1.cross(e2).norm());
+            }
+        }
+        return a;
+    };
+    auto log_area = [&](const char* tag) {
+        std::cout << "[stage6/area] " << tag << "=" << poly_area()
+                  << " polys=" << qmesh.polygons.size() << std::endl;
+    };
+    log_area("entry");
+
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 20); log_area("after_fill"); }
     cleanup_topology(qmesh);
-    tangential_taubin_smoothing(ctx, qmesh, ctx.params->vertex_relax_iters);
+    log_area("after_cleanup");
+    tangential_taubin_smoothing(ctx, qmesh, relax_iters);
+    log_area("after_relax");
     cleanup_topology(qmesh);
-    untangle_low_jacobians(ctx, qmesh);
+    log_area("after_cleanup2");
+    if (!skip_untangle) { untangle_low_jacobians(ctx, qmesh); log_area("after_untangle"); }
 
     // Final exact-position weld & manifold/degenerate face sanitizer
     {
