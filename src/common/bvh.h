@@ -48,6 +48,10 @@ public:
     // Build from HalfEdgeMesh
     bool build_from_halfedge(const HalfEdgeMesh& mesh);
 
+    // Read-only access to the built triangle list (positions v0/v1/v2). Used to derive the
+    // ORIGINAL mesh silhouette (single-face edges) independently of working_mesh cracks.
+    const std::vector<BVHTriangle>& triangles_ref() const { return triangles; }
+
     // Queries
     bool closest_point(
         const Vec3f& query_pt,

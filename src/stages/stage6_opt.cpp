@@ -1,4 +1,5 @@
 #include "stages/stage6_opt.h"
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <vector>
@@ -363,6 +364,72 @@ void Stage6Optimize::fill_small_boundary_holes(
         }
     }
 
+    // ---- is_open_border: the model's LEGITIMATE open silhouette -----------------------
+    // A boundary loop that lies on the original mesh's open border is NOT a hole - it is
+    // the real edge of the surface and must be preserved. Quantize every original boundary
+    // vertex (working_mesh.is_boundary_vertex) into a grid of cell = base_target_length and
+    // remember which cells are occupied. A candidate loop is "on the open border" when most
+    // of its output vertices fall in a border-occupied cell (checked with the 26 neighbours
+    // to absorb welding jitter). Border loops are filled only when MICRO (<= 6 verts): a
+    // tiny nick in the silhouette is safe to close, a real border is not.
+    const float oc = std::max(ctx.base_target_length, 1e-5f);
+    auto ocell = [&](const Vec3f& p) -> std::array<int64_t, 3> {
+        return { (int64_t)std::llround(p.x() / oc),
+                 (int64_t)std::llround(p.y() / oc),
+                 (int64_t)std::llround(p.z() / oc) };
+    };
+    auto okey = [](const std::array<int64_t, 3>& c) -> uint64_t {
+        uint64_t h = (uint64_t)(c[0] * 73856093) ^ (uint64_t)(c[1] * 19349663) ^ (uint64_t)(c[2] * 83492791);
+        return h;
+    };
+    std::unordered_set<uint64_t> open_border_cells;
+    {
+        // ORIGINAL input silhouette = edges that occur in exactly one original triangle.
+        // Built from ctx.original_bvh.triangles (positions, pre-weld, pre-QEM) so cracks
+        // introduced by working_mesh simplification cannot masquerade as an open border.
+        // For a watertight model this set is ~empty -> the guard is inert and real holes
+        // (from assembly misses) get filled; for a model with a genuine open edge the
+        // silhouette is populated and those loops are preserved.
+        std::unordered_map<uint64_t, uint32_t> edge_count;
+        std::vector<std::pair<uint64_t,uint64_t>> edge_cells; // (hash_a, hash_b) per unique edge
+        std::unordered_map<uint64_t, size_t> edge_slot;        // combined key -> index in edge_cells
+        auto cellhash = [&](const Vec3f& a) -> uint64_t { return okey(ocell(a)); };
+        for (const auto& t : ctx.original_bvh.triangles_ref()) {
+            uint64_t hs[3] = { cellhash(t.v0), cellhash(t.v1), cellhash(t.v2) };
+            uint32_t vs[3][2] = {{0,1},{1,2},{2,0}};
+            for (int k = 0; k < 3; ++k) {
+                uint64_t ha = hs[vs[k][0]], hb = hs[vs[k][1]];
+                uint64_t lo = std::min(ha,hb), hi = std::max(ha,hb);
+                uint64_t comb = lo ^ (hi + 0x9e3779b97f4a7c15ull + (lo<<6) + (lo>>2));
+                auto it = edge_slot.find(comb);
+                if (it == edge_slot.end()) {
+                    edge_slot[comb] = edge_cells.size();
+                    edge_cells.push_back({lo,hi});
+                    edge_count[comb] = 1;
+                } else {
+                    edge_count[comb]++;
+                }
+            }
+        }
+        // insert the endpoint cells of every single-face (silhouette) edge
+        for (const auto& sl : edge_slot) {
+            if (edge_count[sl.first] == 1) {
+                const auto& ec = edge_cells[sl.second];
+                open_border_cells.insert(ec.first);
+                open_border_cells.insert(ec.second);
+            }
+        }
+    }
+    auto vertex_on_open_border = [&](uint32_t v) -> bool {
+        auto c = ocell(qmesh.positions[v]);
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz)
+                    if (open_border_cells.count(okey({c[0] + dx, c[1] + dy, c[2] + dz})))
+                        return true;
+        return false;
+    };
+
     // Find and trace simple boundary loops
     std::unordered_map<uint32_t, std::vector<uint32_t>> bnd_adj;
     for (const auto& [u, v] : bnd_edges) {
@@ -372,6 +439,7 @@ void Stage6Optimize::fill_small_boundary_holes(
 
     std::unordered_set<uint32_t> visited_v;
     size_t holes_filled = 0;
+    size_t border_preserved = 0;
 
     for (const auto& [start_v, nbrs] : bnd_adj) {
         if (visited_v.count(start_v) || nbrs.size() != 2) continue;
@@ -406,6 +474,22 @@ void Stage6Optimize::fill_small_boundary_holes(
         }
 
         if (is_simple_loop && loop.size() >= 3 && loop.size() <= max_hole_verts) {
+            // Legit-open-border guard: skip unless the loop is a MICRO nick. Count how many
+            // vertices sit on the original silhouette.
+            {
+                size_t on_border = 0;
+                for (uint32_t lv : loop) if (vertex_on_open_border(lv)) on_border++;
+                // Real open border = a LONG chain whose every vertex lies on the original
+                // silhouette. Welding-jitter false positives are short and only partly
+                // on-border, so requiring ALL verts on border AND a minimum length keeps
+                // the guard protective (caps nothing on a genuine open edge) yet inert on
+                // watertight models (their few flagged edges are jitter, not silhouette).
+                const size_t MIN_BORDER_LOOP = 12;
+                if (on_border == loop.size() && loop.size() >= MIN_BORDER_LOOP) {
+                    border_preserved++;
+                    continue;
+                }
+            }
             // Compute average neighbor normal to ensure correct winding
             Vec3f avg_normal = Vec3f::Zero();
             for (uint32_t lv : loop) {
@@ -460,7 +544,8 @@ void Stage6Optimize::fill_small_boundary_holes(
             }
         }
     }
-    std::cout << "[stage6] small boundary holes filled: " << holes_filled << std::endl;
+    std::cout << "[stage6] small boundary holes filled: " << holes_filled
+              << " border_loops_preserved: " << border_preserved << std::endl;
 }
 
 void Stage6Optimize::tangential_taubin_smoothing(
@@ -1160,7 +1245,7 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     };
     log_area("entry");
 
-    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 300); log_area("after_fill"); }
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 30); log_area("after_fill"); }
     cleanup_topology(qmesh);
     log_area("after_cleanup");
     tangential_taubin_smoothing(ctx, qmesh, relax_iters);
@@ -1169,7 +1254,7 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     log_area("after_cleanup2");
     if (!skip_untangle) { untangle_low_jacobians(ctx, qmesh); log_area("after_untangle"); }
     // Second fill pass: cleanup/untangle can open small holes after the first pass
-    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 300); log_area("after_fill2"); }
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 30); log_area("after_fill2"); }
 
     // Final exact-position weld & manifold/degenerate face sanitizer
     {
@@ -1330,7 +1415,7 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
 
     // Final fill: the exact-position weld / degenerate-face sanitizer above can open
     // holes again after the previous passes
-    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 300); log_area("after_fill3"); }
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 30); log_area("after_fill3"); }
 
     // Drop microscopic disconnected islands (closed shells below 0.5% of the largest
     // shell's area): leftovers of tiny sliver patches that show up as stray components

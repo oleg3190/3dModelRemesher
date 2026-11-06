@@ -1333,6 +1333,47 @@ void Stage4PatchGraph::build_quasi_quad_patches(
             }
         }
         patches[p].boundary_loop = std::move(chains[best]);
+
+        // ---- Cyclic head/tail merge (S24: the open-loop root cause) -------------------
+        // The border walk starts at an arbitrary first source edge. If that edge sits in
+        // the MIDDLE of a canonical path, the loop's head and tail are both the SAME
+        // (path, direction): the walk entered the path at the mid edge, went all the way
+        // around, and re-entered the same path at the end. Linear dedup cannot merge them
+        // (they are not adjacent in the array, only in the cycle). Each ref stores the
+        // FULL path samples, so a double entry duplicates ~d vertices -> degenerate slots
+        // and front()!=back(). Dropping the duplicate tail makes ref[last].end ==
+        // ref[0].start -> the loop closes -> sum(d) is the true sample count -> parity_hacks
+        // disappears. NOTE: this is NOT lossy: each entry is the whole path, so one copy
+        // remains.
+        if (patches[p].boundary_loop.size() >= 2) {
+            const auto& a = patches[p].boundary_loop.front();
+            const auto& b = patches[p].boundary_loop.back();
+            if (a.edge_path_id == b.edge_path_id && a.forward == b.forward)
+                patches[p].boundary_loop.pop_back();
+        }
+    }
+
+    // ---- Closure diagnostic: WHY does samples.front() != samples.back()? --------------
+    // The loop is closed iff ref[0]'s START junction == ref[last]'s END junction. A ref
+    // starts at node_start (forward) or node_end (reverse), and ends at the opposite.
+    // If the walk started mid-path (arbitrary first edge s was not a path endpoint), the
+    // head and tail of that one path both appear, but the dedup only merges CONSECUTIVE
+    // same-path entries, so the loop is left with a genuine junction gap -> open loop.
+    {
+        size_t open_loops = 0, closed_loops = 0;
+        for (size_t p = 0; p < patches.size(); ++p) {
+            const auto& loop = patches[p].boundary_loop;
+            if (loop.size() < 2) { continue; }
+            const auto& first = loop.front();
+            const auto& last = loop.back();
+            const auto& pf = paths[first.edge_path_id];
+            const auto& pl = paths[last.edge_path_id];
+            uint32_t start_v = first.forward ? pf.node_start : pf.node_end;
+            uint32_t end_v   = last.forward  ? pl.node_end   : pl.node_start;
+            if (start_v == end_v) { closed_loops++; } else { open_loops++; }
+        }
+        std::cout << "[stage4/closure] open_loops=" << open_loops
+                  << " closed_loops=" << closed_loops << std::endl;
     }
 
     // Ensure every patch boundary loop with >= 4 mesh vertices has at least 4 canonical paths
