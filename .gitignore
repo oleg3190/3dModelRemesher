@@ -1,0 +1,30 @@
+# Build outputs
+build/
+build2/
+build_*/
+*.o
+*.a
+*.so
+
+# Blender addon wheel payload (rebuilt artifact)
+addon/qremesh/wheels/libqremesh_core.so
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Local deps (apt-get download + dpkg -x)
+.deps/
+
+# Test scratch outputs (regenerable; keep input.obj + .py tooling tracked)
+test_out/*.obj
+test_out/*.png
+test_out/*.json
+test_out/dumps_*/
