@@ -41,6 +41,34 @@ def load_polys(path):
     return np.asarray(verts, dtype=np.float64), polys
 
 
+def winding_conflicts(polys):
+    """Edges whose two incident faces traverse them in the SAME direction.
+
+    The detector's dihedral is a signed dot of face normals, so a ~180 deg reading means a
+    geometric fold ONLY while the mesh is consistently oriented; otherwise it is flipped
+    winding. Returns the number of conflicting edges (0 = signed dihedral is trustworthy).
+    """
+    seen = {}
+    conflicts = 0
+    for fi, idx in enumerate(polys):
+        n = len(idx)
+        for i in range(n):
+            a, b = idx[i], idx[(i + 1) % n]
+            if a == b:
+                continue
+            key = (min(a, b), max(a, b))
+            d = 1 if a < b else -1
+            if key not in seen:
+                seen[key] = (d, fi)
+            else:
+                d0, f0 = seen[key]
+                if f0 != fi:
+                    if d0 == d:
+                        conflicts += 1
+                    seen[key] = (d0, f0)  # keep first; >2 faces handled by the caller's gate
+    return conflicts
+
+
 def face_normals(V, polys):
     """Newell normals per polygon (robust for non-planar quads)."""
     N = np.zeros((len(polys), 3))
@@ -176,6 +204,8 @@ def main():
         "creased_out": int(len(creased)),
         "smooth_creases": int(len(smooth)),
         "target_verts": int(len(targets)),
+        "winding_conflicts": winding_conflicts(po),
+        "src_winding_conflicts": winding_conflicts(ps),
         "min_sj": float(sj.min()), "median_sj": float(np.median(sj)),
         "sj_negative": int((sj < 0).sum()),
     }

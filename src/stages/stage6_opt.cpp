@@ -1002,7 +1002,11 @@ void Stage6Optimize::localized_smooth_crease_repair(RemeshContext& ctx, QuadMesh
         return (static_cast<uint64_t>(std::min(a, b)) << 32) | static_cast<uint32_t>(std::max(a, b));
     };
 
-    struct OutEdge { uint32_t f0 = INVALID_INDEX; uint32_t f1 = INVALID_INDEX; };
+    // dir0/dir1: +1 if the face traverses the edge min->max, -1 if max->min. Two faces on a
+    // consistently oriented manifold must disagree; agreement = a WINDING CONFLICT, which would
+    // make a signed-normal dihedral of ~180 deg meaningless (coplanar faces would read as folds).
+    struct OutEdge { uint32_t f0 = INVALID_INDEX; uint32_t f1 = INVALID_INDEX;
+                     int8_t dir0 = 0, dir1 = 0; };
     std::unordered_map<uint64_t, OutEdge> out_edges;
     out_edges.reserve(nf * 2);
     std::unordered_set<uint64_t> nm_edges;   // >2 incident faces: ambiguous, never a crease cue
@@ -1015,12 +1019,16 @@ void Stage6Optimize::localized_smooth_crease_repair(RemeshContext& ctx, QuadMesh
             uint32_t a = p[i], b = p[(i + 1) % pn];
             if (a == b || a >= nv || b >= nv) continue;
             uint64_t k = ekey(a, b);
+            const int8_t dir = (a < b) ? 1 : -1;
             auto it = out_edges.find(k);
             if (it == out_edges.end()) {
-                OutEdge oe; oe.f0 = static_cast<uint32_t>(fi);
+                OutEdge oe; oe.f0 = static_cast<uint32_t>(fi); oe.dir0 = dir;
                 out_edges.emplace(k, oe);
             } else if (it->second.f1 == INVALID_INDEX && nm_edges.count(k) == 0) {
-                if (it->second.f0 != static_cast<uint32_t>(fi)) it->second.f1 = static_cast<uint32_t>(fi);
+                if (it->second.f0 != static_cast<uint32_t>(fi)) {
+                    it->second.f1 = static_cast<uint32_t>(fi);
+                    it->second.dir1 = dir;
+                }
             } else {
                 nm_edges.insert(k);
             }
@@ -1099,6 +1107,15 @@ void Stage6Optimize::localized_smooth_crease_repair(RemeshContext& ctx, QuadMesh
         }
         return m;
     };
+
+    // Winding audit of the detector's assumption (measured here, not assumed): dihedral is a
+    // SIGNED dot of face normals, so it only means "fold" while the output stays consistently
+    // oriented. 0 conflicts => a ~180 deg reading is a real pleat, not flipped winding.
+    size_t winding_conflicts = 0;
+    for (const auto& [k, oe] : out_edges) {
+        if (oe.f0 == INVALID_INDEX || oe.f1 == INVALID_INDEX) continue;
+        if (oe.dir0 != 0 && oe.dir1 != 0 && oe.dir0 == oe.dir1) winding_conflicts++;
+    }
 
     // =========================================================================
     // 2) SOURCE local roughness (analytic, from original_bvh triangles)
@@ -1283,6 +1300,7 @@ void Stage6Optimize::localized_smooth_crease_repair(RemeshContext& ctx, QuadMesh
     if (targets == 0 || n_movable == 0) {
         std::cout << "[stage6/t7] creased=" << creased << " target_faces=" << targets
                   << " movable_verts=" << n_movable << " src_tris=" << nt
+                  << " winding_conflicts=" << winding_conflicts
                   << " gate(out>" << out_dih_deg << ",src<" << src_gate_deg
                   << ",R=" << rel << ") moved=0 (nothing to repair)" << std::endl;
         std::cout << "[stage6/t7/pins] crease_edges=" << crease_edges
@@ -1613,6 +1631,9 @@ void Stage6Optimize::localized_smooth_crease_repair(RemeshContext& ctx, QuadMesh
               << " creased=" << creased << " target_faces=" << targets
               << " movable_verts=" << n_movable << " iters=" << iters
               << " moved=" << moves << " targets_left=" << targets_after
+              << " winding_conflicts=" << winding_conflicts
+              << (winding_conflicts ? " (DIHEDRAL GATE UNRELIABLE: fix output orientation first)"
+                                    : " (signed dihedral trustworthy)")
               << " area=" << global_area << std::endl;
     std::cout << "[stage6/t7/pins] crease_edges=" << crease_edges
               << " endpoint_movable=" << crease_ep_movable
