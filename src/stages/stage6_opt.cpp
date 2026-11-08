@@ -958,6 +958,678 @@ void Stage6Optimize::untangle_low_jacobians(
     }
 }
 
+// ---------------------------------------------------------------------------
+// T7 (BUG-01): localized smooth-crease repair.
+//
+// The detector is ANALYTIC 3D, no screenshot: an output face is a repair target only when
+//   (a) it is creased  - max dihedral over its edges > OUT_DIH (default 120 deg), AND
+//   (b) the ORIGINAL source under it is locally smooth - max source-triangle dihedral within
+//       R = REL * bbox_diag (default 1%) < SRC_GATE (default 30 deg).
+// Gate (b) is the whole point: on a noisy AI mesh 87% of creased output faces sit on REAL
+// relief (1707 of 1896 in the ADR measurement); smoothing them would erase detail. Only the
+// remaining gouges on genuinely smooth source (the BUG-01 arrows) are touched.
+//
+// The repair moves ONLY grid-interior vertices of target faces (valence 4, not on an open
+// border, not on a sharp/feature edge = Dirichlet borders and features stay pinned), slides
+// them out of the fold onto the local smooth plane, snaps them back on-surface with
+// original_bvh, and every move is gated by an anchor slide-cap + a global area band + a
+// no-SJ-regression test (invariant #7). Deterministic: serial, index-ordered, hash maps are
+// only point-looked-up, never iterated.
+// ---------------------------------------------------------------------------
+void Stage6Optimize::localized_smooth_crease_repair(RemeshContext& ctx, QuadMeshResult& qmesh) {
+    const size_t nv = qmesh.positions.size();
+    const size_t nf = qmesh.polygons.size();
+    if (nv < 4 || nf < 2) return;
+
+    // --- tunables (env; the ON/OFF gate lives in execute(), default OFF = baseline) ------
+    float out_dih_deg = 120.0f;
+    float src_gate_deg = 30.0f;
+    float rel = 0.01f;
+    int iters = 8;
+    float step_beta = 1.0f;      // fraction of the out-of-plane offset removed per attempt
+    if (const char* e = std::getenv("QREMESH_T7_OUT_DIH"))  { float v = std::atof(e); if (v > 0) out_dih_deg = v; }
+    if (const char* e = std::getenv("QREMESH_T7_SRC_GATE")) { float v = std::atof(e); if (v > 0) src_gate_deg = v; }
+    if (const char* e = std::getenv("QREMESH_T7_REL"))      { float v = std::atof(e); if (v > 0) rel = v; }
+    if (const char* e = std::getenv("QREMESH_T7_ITERS"))    { int v = std::atoi(e); if (v >= 0) iters = v; }
+    if (const char* e = std::getenv("QREMESH_T7_STEP"))     { float v = std::atof(e); if (v > 0 && v <= 1) step_beta = v; }
+
+    auto deg_of = [](float c) { return std::acos(std::max(-1.0f, std::min(1.0f, c))) * 180.0f / PI_F; };
+
+    // =========================================================================
+    // 1) OUTPUT adjacency + face normals + per-face max dihedral
+    // =========================================================================
+    auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+        return (static_cast<uint64_t>(std::min(a, b)) << 32) | static_cast<uint32_t>(std::max(a, b));
+    };
+
+    struct OutEdge { uint32_t f0 = INVALID_INDEX; uint32_t f1 = INVALID_INDEX; };
+    std::unordered_map<uint64_t, OutEdge> out_edges;
+    out_edges.reserve(nf * 2);
+    std::unordered_set<uint64_t> nm_edges;   // >2 incident faces: ambiguous, never a crease cue
+
+    for (size_t fi = 0; fi < nf; ++fi) {
+        const auto& p = qmesh.polygons[fi];
+        const size_t pn = p.size();
+        if (pn < 3) continue;
+        for (size_t i = 0; i < pn; ++i) {
+            uint32_t a = p[i], b = p[(i + 1) % pn];
+            if (a == b || a >= nv || b >= nv) continue;
+            uint64_t k = ekey(a, b);
+            auto it = out_edges.find(k);
+            if (it == out_edges.end()) {
+                OutEdge oe; oe.f0 = static_cast<uint32_t>(fi);
+                out_edges.emplace(k, oe);
+            } else if (it->second.f1 == INVALID_INDEX && nm_edges.count(k) == 0) {
+                if (it->second.f0 != static_cast<uint32_t>(fi)) it->second.f1 = static_cast<uint32_t>(fi);
+            } else {
+                nm_edges.insert(k);
+            }
+        }
+    }
+
+    // Newell normal per polygon (robust on non-planar quads)
+    auto newell = [&](size_t fi) -> Vec3f {
+        const auto& p = qmesh.polygons[fi];
+        Vec3d n = Vec3d::Zero();
+        const size_t pn = p.size();
+        for (size_t i = 0; i < pn; ++i) {
+            Vec3d a = qmesh.positions[p[i]].cast<double>();
+            Vec3d b = qmesh.positions[p[(i + 1) % pn]].cast<double>();
+            n += a.cross(b);
+        }
+        double ln = n.norm();
+        if (ln < 1e-14) return Vec3f(0.0f, 0.0f, 0.0f);
+        return (n / ln).cast<float>();
+    };
+
+    std::vector<Vec3f> fnorm(nf);
+    for (size_t fi = 0; fi < nf; ++fi) fnorm[fi] = newell(fi);
+
+    // vertex -> incident faces / incident edges / ring neighbours
+    // NOTE: v_edges holds the 64-bit packed edge keys (uint32_t would truncate -> lookups
+    // miss -> every vertex looks flat; that bug silently stalled the whole pass once).
+    std::vector<std::vector<uint32_t>> v_faces(nv), v_ring(nv);
+    std::vector<std::vector<uint64_t>> v_edges(nv);
+    std::vector<uint8_t> on_border(nv, 0);
+    for (const auto& [k, oe] : out_edges) {
+        uint32_t a = static_cast<uint32_t>(k >> 32);
+        uint32_t b = static_cast<uint32_t>(k & 0xFFFFFFFFu);
+        v_edges[a].push_back(k);
+        v_edges[b].push_back(k);
+        v_ring[a].push_back(b);
+        v_ring[b].push_back(a);
+        if (oe.f1 == INVALID_INDEX) { on_border[a] = 1; on_border[b] = 1; }
+        // vertex -> incident faces (a faces list per VERTEX; building it the other way round
+        // makes every vertex->face lookup read vertex ids as face indices -> wild memory)
+        if (oe.f0 != INVALID_INDEX && oe.f0 < nf) { v_faces[a].push_back(oe.f0); v_faces[b].push_back(oe.f0); }
+        if (oe.f1 != INVALID_INDEX && oe.f1 < nf) { v_faces[a].push_back(oe.f1); v_faces[b].push_back(oe.f1); }
+    }
+    for (size_t v = 0; v < nv; ++v) {
+        std::sort(v_faces[v].begin(), v_faces[v].end());
+        v_faces[v].erase(std::unique(v_faces[v].begin(), v_faces[v].end()), v_faces[v].end());
+        std::sort(v_ring[v].begin(), v_ring[v].end());
+        v_ring[v].erase(std::unique(v_ring[v].begin(), v_ring[v].end()), v_ring[v].end());
+        std::sort(v_edges[v].begin(), v_edges[v].end());
+        v_edges[v].erase(std::unique(v_edges[v].begin(), v_edges[v].end()), v_edges[v].end());
+    }
+
+    auto edge_dih = [&](uint64_t k) -> float {
+        auto it = out_edges.find(k);
+        if (it == out_edges.end()) return 0.0f;
+        if (it->second.f0 == INVALID_INDEX || it->second.f1 == INVALID_INDEX) return 0.0f;
+        return deg_of(fnorm[it->second.f0].dot(fnorm[it->second.f1]));
+    };
+    auto face_max_dih = [&](uint32_t fi) -> float {
+        const auto& p = qmesh.polygons[fi];
+        const size_t pn = p.size();
+        float m = 0.0f;
+        for (size_t i = 0; i < pn; ++i) {
+            uint32_t a = p[i], b = p[(i + 1) % pn];
+            if (a == b) continue;
+            float d = edge_dih(ekey(a, b));
+            if (d > m) m = d;
+        }
+        return m;
+    };
+    auto vert_max_dih = [&](uint32_t v) -> float {
+        float m = 0.0f;
+        for (uint64_t k : v_edges[v]) {
+            float d = edge_dih(k);
+            if (d > m) m = d;
+        }
+        return m;
+    };
+
+    // =========================================================================
+    // 2) SOURCE local roughness (analytic, from original_bvh triangles)
+    // =========================================================================
+    struct PKey { int64_t x, y, z; bool operator==(const PKey& o) const { return x==o.x && y==o.y && z==o.z; } };
+    struct PKeyHash {
+        size_t operator()(const PKey& k) const {
+            size_t h = static_cast<size_t>(k.x) * 73856093ULL;
+            h ^= static_cast<size_t>(k.y) * 19349663ULL;
+            h ^= static_cast<size_t>(k.z) * 83492791ULL;
+            return h;
+        }
+    };
+    const float Q = 1e6f;
+    auto pq = [&](const Vec3f& p) -> PKey {
+        return PKey{ std::llround(static_cast<double>(p.x()) * Q),
+                     std::llround(static_cast<double>(p.y()) * Q),
+                     std::llround(static_cast<double>(p.z()) * Q) };
+    };
+
+    const auto& src_tris = ctx.original_bvh.triangles_ref();
+    const size_t nt = src_tris.size();
+    std::vector<uint32_t> tri_vid(nt * 3, INVALID_INDEX);
+    std::vector<Vec3f> src_v;
+    src_v.reserve(nt * 3);
+    std::unordered_map<PKey, uint32_t, PKeyHash> src_vmap;
+    if (nt)
+        src_vmap.reserve(nt * 3);
+
+    struct SrcEdge { uint32_t t0 = INVALID_INDEX; uint32_t t1 = INVALID_INDEX; };
+    std::unordered_map<uint64_t, SrcEdge> src_edges;
+    if (nt)
+        src_edges.reserve(nt * 2);
+    std::unordered_set<uint64_t> src_nm;
+
+    auto get_vid = [&](const Vec3f& p) -> uint32_t {
+        PKey k = pq(p);
+        auto it = src_vmap.find(k);
+        if (it != src_vmap.end()) return it->second;
+        uint32_t id = static_cast<uint32_t>(src_v.size());
+        src_v.push_back(p);
+        src_vmap.emplace(k, id);
+        return id;
+    };
+
+    for (size_t ti = 0; ti < nt; ++ti) {
+        const BVHTriangle& t = src_tris[ti];
+        const Vec3f* cp = &t.v0;
+        for (int i = 0; i < 3; ++i) tri_vid[ti * 3 + i] = get_vid(cp[i]);
+        for (int i = 0; i < 3; ++i) {
+            uint32_t a = tri_vid[ti * 3 + i], b = tri_vid[ti * 3 + (i + 1) % 3];
+            if (a == b) continue;
+            uint64_t k = ekey(a, b);
+            auto it = src_edges.find(k);
+            if (it == src_edges.end()) {
+                SrcEdge se; se.t0 = static_cast<uint32_t>(ti);
+                src_edges.emplace(k, se);
+            } else if (it->second.t1 == INVALID_INDEX && src_nm.count(k) == 0) {
+                if (it->second.t0 != static_cast<uint32_t>(ti)) it->second.t1 = static_cast<uint32_t>(ti);
+            } else {
+                src_nm.insert(k);
+            }
+        }
+    }
+
+    // per-source-triangle max dihedral with its edge neighbours (winding as-is, same
+    // convention as the reference python detector test_out/smooth_creases.py)
+    std::vector<float> tri_dih(nt, 0.0f);
+    for (const auto& [k, se] : src_edges) {
+        if (se.t0 == INVALID_INDEX || se.t1 == INVALID_INDEX) continue;
+        float d = deg_of(src_tris[se.t0].normal.dot(src_tris[se.t1].normal));
+        if (d > tri_dih[se.t0]) tri_dih[se.t0] = d;
+        if (d > tri_dih[se.t1]) tri_dih[se.t1] = d;
+    }
+
+    const float R = std::max(1e-5f, rel * ctx.bbox_diag);
+    auto cellkey = [&](int64_t x, int64_t y, int64_t z) -> uint64_t {
+        // spatial hash of grid cells (lookups only; never iterated)
+        auto mix = [](int64_t v) { return static_cast<uint64_t>(v + 0x9e3779b97f4a7c15ULL); };
+        return mix(x) ^ (mix(y) * 0x9e3779b97f4a7c15ULL) ^ (mix(z) * 0xc2b2ae3d27d4eb4fULL);
+    };
+    const double invR = 1.0 / static_cast<double>(R);
+    std::unordered_map<uint64_t, std::vector<uint32_t>> src_grid;
+    std::vector<Vec3f> tri_c(nt);
+    for (size_t ti = 0; ti < nt; ++ti) {
+        const BVHTriangle& t = src_tris[ti];
+        Vec3f c = (t.v0 + t.v1 + t.v2) * (1.0f / 3.0f);
+        tri_c[ti] = c;
+        int64_t gx = static_cast<int64_t>(std::floor(c.x() * invR));
+        int64_t gy = static_cast<int64_t>(std::floor(c.y() * invR));
+        int64_t gz = static_cast<int64_t>(std::floor(c.z() * invR));
+        src_grid[cellkey(gx, gy, gz)].push_back(static_cast<uint32_t>(ti));
+    }
+
+    auto src_rough_at = [&](const Vec3f& p) -> float {
+        int64_t gx = static_cast<int64_t>(std::floor(p.x() * invR));
+        int64_t gy = static_cast<int64_t>(std::floor(p.y() * invR));
+        int64_t gz = static_cast<int64_t>(std::floor(p.z() * invR));
+        float m = 0.0f;
+        const double r2 = static_cast<double>(R) * R;
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz) {
+                    auto it = src_grid.find(cellkey(gx + dx, gy + dy, gz + dz));
+                    if (it == src_grid.end()) continue;
+                    for (uint32_t ti : it->second) {
+                        Vec3f d = tri_c[ti] - p;
+                        if (d.squaredNorm() <= r2 && tri_dih[ti] > m) m = tri_dih[ti];
+                    }
+                }
+        return m;
+    };
+
+    // =========================================================================
+    // 3) Target mask: creased output face x locally smooth source
+    // =========================================================================
+    std::vector<uint8_t> is_target(nf, 0);
+    size_t creased = 0, targets = 0;
+    for (size_t fi = 0; fi < nf; ++fi) {
+        if (qmesh.polygons[fi].size() != 4) continue;
+        if (face_max_dih(static_cast<uint32_t>(fi)) <= out_dih_deg) continue;
+        creased++;
+        const auto& p = qmesh.polygons[fi];
+        Vec3f c = Vec3f::Zero();
+        for (uint32_t v : p) c += qmesh.positions[v];
+        c *= 0.25f;
+        if (src_rough_at(c) < src_gate_deg) {
+            is_target[fi] = 1;
+            targets++;
+        }
+    }
+
+    // Movable set: grid-interior nodes of target faces only.
+    // Pinned: open-border vertices (Dirichlet), sharp/feature-edge vertices, valence != 4.
+    std::vector<uint8_t> movable(nv, 0);
+    std::unordered_set<uint64_t> sharp_set;
+    sharp_set.reserve(qmesh.sharp_edges.size() * 2);
+    for (const auto& e : qmesh.sharp_edges) {
+        if (e.first < nv && e.second < nv && e.first != e.second)
+            sharp_set.insert(ekey(e.first, e.second));
+    }
+    std::vector<uint8_t> on_sharp(nv, 0);
+    for (uint64_t k : sharp_set) {
+        uint32_t a = static_cast<uint32_t>(k >> 32), b = static_cast<uint32_t>(k & 0xFFFFFFFFu);
+        on_sharp[a] = 1; on_sharp[b] = 1;
+    }
+    // Pin reasons (telemetry): a target-face corner may not move if it is on the open
+    // border (Dirichlet), on a sharp/feature edge, or not a regular grid node (valence != 4).
+    auto pin_reason = [&](uint32_t v) -> int {
+        if (v >= nv) return 4;
+        if (on_border[v]) return 1;
+        if (on_sharp[v]) return 2;
+        if (v_faces[v].size() != 4 || v_ring[v].size() != 4) return 3;
+        return 0;
+    };
+    for (size_t fi = 0; fi < nf; ++fi) {
+        if (!is_target[fi]) continue;
+        for (uint32_t v : qmesh.polygons[fi]) {
+            if (v < nv && pin_reason(v) == 0) movable[v] = 1;
+        }
+    }
+    size_t n_movable = 0;
+    for (size_t v = 0; v < nv; ++v) n_movable += movable[v] ? 1 : 0;
+    // Crease-edge endpoints: what actually pins the fold? (diagnosis of a stalled pass)
+    size_t pin_border = 0, pin_sharp = 0, pin_valence = 0, crease_ep_movable = 0, crease_edges = 0;
+    for (const auto& [k, oe] : out_edges) {
+        if (oe.f0 == INVALID_INDEX || oe.f1 == INVALID_INDEX) continue;
+        if (edge_dih(k) <= out_dih_deg) continue;
+        if (!is_target[oe.f0] && !is_target[oe.f1]) continue;
+        crease_edges++;
+        uint32_t a = static_cast<uint32_t>(k >> 32), b = static_cast<uint32_t>(k & 0xFFFFFFFFu);
+        for (uint32_t v : {a, b}) {
+            switch (pin_reason(v)) {
+                case 0: crease_ep_movable++; break;
+                case 1: pin_border++; break;
+                case 2: pin_sharp++; break;
+                default: pin_valence++; break;
+            }
+        }
+    }
+
+    if (targets == 0 || n_movable == 0) {
+        std::cout << "[stage6/t7] creased=" << creased << " target_faces=" << targets
+                  << " movable_verts=" << n_movable << " src_tris=" << nt
+                  << " gate(out>" << out_dih_deg << ",src<" << src_gate_deg
+                  << ",R=" << rel << ") moved=0 (nothing to repair)" << std::endl;
+        std::cout << "[stage6/t7/pins] crease_edges=" << crease_edges
+                  << " endpoint_movable=" << crease_ep_movable
+                  << " pinned_border=" << pin_border << " pinned_sharp=" << pin_sharp
+                  << " pinned_valence=" << pin_valence << std::endl;
+        return;
+    }
+
+    // =========================================================================
+    // 4) Localized anti-fold / planarize pass
+    // =========================================================================
+    const std::vector<Vec3f> anchor = qmesh.positions;
+    std::vector<float> slide_cap(nv, 0.0f);   // 1.0 x shortest incident edge (as untangle)
+    for (const auto& [k, oe] : out_edges) {
+        uint32_t a = static_cast<uint32_t>(k >> 32);
+        uint32_t b = static_cast<uint32_t>(k & 0xFFFFFFFFu);
+        float len = (anchor[a] - anchor[b]).norm();
+        if (len <= 1e-9f) continue;
+        if (slide_cap[a] <= 0.0f || len < slide_cap[a]) slide_cap[a] = len;
+        if (slide_cap[b] <= 0.0f || len < slide_cap[b]) slide_cap[b] = len;
+    }
+
+    auto poly_area_of = [&](uint32_t v) -> double {
+        double a = 0.0;
+        for (uint32_t fi : v_faces[v]) {
+            const auto& p = qmesh.polygons[fi];
+            if (p.size() < 3) continue;
+            const Vec3f& a0 = qmesh.positions[p[0]];
+            for (size_t k = 1; k + 1 < p.size(); ++k) {
+                Vec3f e1 = qmesh.positions[p[k]] - a0;
+                Vec3f e2 = qmesh.positions[p[k + 1]] - a0;
+                a += 0.5 * static_cast<double>(e1.cross(e2).norm());
+            }
+        }
+        return a;
+    };
+    double global_area = 0.0;
+    for (size_t fi = 0; fi < nf; ++fi) {
+        const auto& p = qmesh.polygons[fi];
+        if (p.size() < 3) continue;
+        const Vec3f& a0 = qmesh.positions[p[0]];
+        for (size_t k = 1; k + 1 < p.size(); ++k) {
+            Vec3f e1 = qmesh.positions[p[k]] - a0;
+            Vec3f e2 = qmesh.positions[p[k + 1]] - a0;
+            global_area += 0.5 * static_cast<double>(e1.cross(e2).norm());
+        }
+    }
+    const double area_lo = 0.94 * global_area;
+    const double area_hi = 1.05 * global_area;
+
+    auto min_incident_sj = [&](uint32_t v) -> float {
+        float m = 1.0f;
+        for (uint32_t fi : v_faces[v]) {
+            const auto& p = qmesh.polygons[fi];
+            if (p.size() != 4) continue;
+            m = std::min(m, compute_scaled_jacobian(
+                qmesh.positions[p[0]], qmesh.positions[p[1]],
+                qmesh.positions[p[2]], qmesh.positions[p[3]]));
+        }
+        return m;
+    };
+    auto refresh_incident = [&](uint32_t v) {
+        for (uint32_t fi : v_faces[v]) fnorm[fi] = newell(fi);
+    };
+
+    auto face_area = [&](uint32_t fi) -> double {
+        const auto& p = qmesh.polygons[fi];
+        if (p.size() < 3) return 0.0;
+        const Vec3f& a0 = qmesh.positions[p[0]];
+        double a = 0.0;
+        for (size_t k = 1; k + 1 < p.size(); ++k) {
+            Vec3f e1 = qmesh.positions[p[k]] - a0;
+            Vec3f e2 = qmesh.positions[p[k + 1]] - a0;
+            a += 0.5 * static_cast<double>(e1.cross(e2).norm());
+        }
+        return a;
+    };
+
+    // Pleat unfold (family 2): the BUG-01 gouges are NOT out-of-plane bumps - measured, the
+    // fold pair lies on the SAME side of its shared edge (one quad folded back inside the
+    // other, dihedral ~180 deg). Unfolding = rotate the smaller flap RIGIDLY about the crease
+    // edge axis by the fold angle (the "open the book flat" motion). A rigid rotation keeps
+    // the flap's winding, unlike a mirror reflection through the edge line, which flips the
+    // flap inside out (measured: reflect dropped the fold 179.9->21 deg but SJ 0.22 -> -0.33).
+    // Afterwards the vertices are snapped back onto the source (locally planar by the gate).
+    struct MoveSet {
+        std::vector<uint32_t> verts, faces;
+        std::vector<uint64_t> edges;
+    };
+    auto collect_move_set = [&](std::initializer_list<uint32_t> vs) -> MoveSet {
+        MoveSet ms;
+        for (uint32_t v : vs) {
+            ms.verts.push_back(v);
+            for (uint32_t fi : v_faces[v]) ms.faces.push_back(fi);
+            for (uint64_t ek : v_edges[v]) ms.edges.push_back(ek);
+        }
+        std::sort(ms.faces.begin(), ms.faces.end());
+        ms.faces.erase(std::unique(ms.faces.begin(), ms.faces.end()), ms.faces.end());
+        std::sort(ms.edges.begin(), ms.edges.end());
+        ms.edges.erase(std::unique(ms.edges.begin(), ms.edges.end()), ms.edges.end());
+        return ms;
+    };
+    auto set_crease_max = [&](const MoveSet& ms) -> float {
+        float m = 0.0f;
+        for (uint64_t e : ms.edges) m = std::max(m, edge_dih(e));
+        return m;
+    };
+    auto set_min_sj = [&](const MoveSet& ms) -> float {
+        float m = 1.0f;
+        for (uint32_t f : ms.faces) {
+            const auto& p = qmesh.polygons[f];
+            if (p.size() != 4) continue;
+            m = std::min(m, compute_scaled_jacobian(
+                qmesh.positions[p[0]], qmesh.positions[p[1]],
+                qmesh.positions[p[2]], qmesh.positions[p[3]]));
+        }
+        return m;
+    };
+    auto set_area = [&](const MoveSet& ms) -> double {
+        double a = 0.0;
+        for (uint32_t f : ms.faces) a += face_area(f);
+        return a;
+    };
+
+    size_t d_unfold_try = 0, d_unfold_ok = 0, d_rej_pin = 0;
+    size_t d_unfold_rej_fold = 0, d_unfold_rej_sj = 0, d_unfold_rej_area = 0;
+    const float cap_scale = []() {
+        float c = 1.6f;
+        if (const char* e = std::getenv("QREMESH_T7_CAP")) { float v = std::atof(e); if (v > 0) c = v; }
+        return c;
+    }();
+    const int family_mask = []() {
+        int m = 3;   // bit0 = planarize family, bit1 = pleat-reflect family
+        if (const char* e = std::getenv("QREMESH_T7_MODE")) m = std::atoi(e);
+        return m;
+    }();
+    size_t moves = 0;
+    // Rejection-reason counters (QREMESH_T7_DEBUG=1) - where the repair actually stalls.
+    const bool dbg = (std::getenv("QREMESH_T7_DEBUG") != nullptr);
+    const bool loose = (std::getenv("QREMESH_T7_LOOSE") != nullptr);
+    size_t d_target_active = 0, d_corner = 0, d_no_fold = 0, d_tiny_h = 0;
+    size_t d_rej_cap = 0, d_rej_dih = 0, d_rej_sj = 0, d_rej_area = 0, d_no_bvh = 0, d_sample = 0;
+    for (int it = 0; it < iters; ++it) {
+        bool any = false;
+        for (size_t fi = 0; fi < nf; ++fi) {
+            if (!is_target[fi]) continue;
+            if (face_max_dih(static_cast<uint32_t>(fi)) <= out_dih_deg) continue;  // healed
+            const auto& poly = qmesh.polygons[fi];
+            if (poly.size() != 4) continue;
+
+            // local smooth plane: face centroid snapped onto the source, source normal
+            Vec3f c = Vec3f::Zero();
+            for (uint32_t v : poly) c += qmesh.positions[v];
+            c *= 0.25f;
+            Vec3f sn, cp;
+            float d2;
+            if (!ctx.original_bvh.closest_point(c, cp, sn, d2)) { d_no_bvh++; continue; }
+            if (sn.squaredNorm() < 1e-12f) continue;
+            sn.normalize();
+            if (sn.dot(fnorm[fi]) < 0.0f) sn = -sn;
+
+            if (family_mask & 1) {
+                for (int k = 0; k < 4; ++k) {
+                    uint32_t v = poly[k];
+                    if (v >= nv || !movable[v]) continue;
+                    d_corner++;
+
+                    const float d_before = vert_max_dih(v);
+                    if (d_before <= out_dih_deg) { d_no_fold++; continue; }   // not in a fold
+                    const float sj_before = min_incident_sj(v);
+                    const double a_before = poly_area_of(v);
+                    const Vec3f orig_p = qmesh.positions[v];
+
+                    // ring centroid = the flat neighbourhood the fold punched through
+                    Vec3f g = Vec3f::Zero();
+                    for (uint32_t nb : v_ring[v]) g += qmesh.positions[nb];
+                    g /= static_cast<float>(v_ring[v].size());
+                    const float h = (orig_p - g).dot(sn);   // out-of-plane offset of the apex
+                    if (std::fabs(h) < 1e-7f) { d_tiny_h++; continue; }
+                    if (dbg) d_target_active++;
+
+                    for (float beta : { step_beta, 0.5f * step_beta }) {
+                        Vec3f cand = orig_p - (beta * h) * sn;
+                        Vec3f snap;
+                        float sd2;
+                        Vec3f sn2;
+                        if (ctx.original_bvh.closest_point(cand, snap, sn2, sd2)) cand = snap;
+                        if ((cand - anchor[v]).norm() > slide_cap[v]) { d_rej_cap++; continue; }   // anti-migration
+
+                        qmesh.positions[v] = cand;
+                        refresh_incident(v);
+                        const float d_after = vert_max_dih(v);
+                        const float sj_after = min_incident_sj(v);
+                        if (dbg && d_sample < 12) {
+                            d_sample++;
+                            std::cout << "  [t7 sample] v=" << v << " h=" << h
+                                      << " cap=" << slide_cap[v]
+                                      << " dih " << d_before << "->" << d_after
+                                      << " sj " << sj_before << "->" << sj_after << std::endl;
+                        }
+                        const double a_after = poly_area_of(v);
+                        const double projected = global_area - a_before + a_after;
+                        const bool area_ok = (projected >= area_lo && projected <= area_hi);
+                        if (dbg && d_after >= d_before - 0.5f) d_rej_dih++;
+                        // must relax the fold, must not create/ deepen an inverted quad, stay in band
+                        if (d_after < d_before - 0.5f && sj_after >= sj_before - 0.01f && area_ok) {
+                            global_area = projected;
+                            moves++;
+                            any = true;
+                            break;
+                        }
+                        if (dbg && !area_ok) d_rej_area++;
+                        else if (dbg) d_rej_sj++;
+                        qmesh.positions[v] = orig_p;
+                        refresh_incident(v);
+                    }
+                }
+            }
+
+            // ---- family 2: pleat unfold over the crease edges of this target face ----
+            if (family_mask & 2) {
+                for (int i = 0; i < 4; ++i) {
+                    uint32_t a = poly[i], b = poly[(i + 1) % 4];
+                    const uint64_t ek = ekey(a, b);
+                    if (edge_dih(ek) <= out_dih_deg) continue;
+                    auto it = out_edges.find(ek);
+                    if (it == out_edges.end()) continue;
+                    const uint32_t fa = it->second.f0, fb = it->second.f1;
+                    if (fa == INVALID_INDEX || fb == INVALID_INDEX) continue;
+
+                    const uint32_t flap = (face_area(fa) <= face_area(fb)) ? fa : fb;
+                    uint32_t fv[2]; int fcnt = 0;
+                    for (uint32_t v : qmesh.polygons[flap]) {
+                        if (v != a && v != b && fcnt < 2) fv[fcnt++] = v;
+                    }
+                    if (fcnt < 2) continue;
+                    // QREMESH_T7_LOOSE=1 lets the unfold also move irregular grid nodes
+                    // (valence 3..6); border and feature-edge vertices stay pinned always.
+                    if (loose) {
+                        auto ok_loose = [&](uint32_t v) {
+                            return v < nv && !on_border[v] && !on_sharp[v] &&
+                                   v_faces[v].size() >= 3 && v_faces[v].size() <= 6;
+                        };
+                        if (!ok_loose(fv[0]) || !ok_loose(fv[1])) { d_rej_pin++; continue; }
+                    } else if (pin_reason(fv[0]) != 0 || pin_reason(fv[1]) != 0) {
+                        d_rej_pin++;
+                        continue;
+                    }
+
+                    const MoveSet ms = collect_move_set({fv[0], fv[1]});
+                    const float crease_before = set_crease_max(ms);
+                    const float sj_before = set_min_sj(ms);
+                    const double area_before = set_area(ms);
+                    if (crease_before <= out_dih_deg) continue;
+                    d_unfold_try++;
+
+                    const Vec3f pa0 = qmesh.positions[a], pb0 = qmesh.positions[b];
+                    Vec3f axis = pb0 - pa0;
+                    if (axis.squaredNorm() < 1e-14f) continue;
+                    axis.normalize();
+                    const float fold = edge_dih(ek);   // degrees to remove
+                    bool unfolded = false;
+
+                    for (float sgn : { 1.0f, -1.0f }) {
+                      if (unfolded) break;
+                      for (float alpha : { 1.0f, 0.6f }) {
+                        Vec3f np[2];
+                        bool cap_ok = true;
+                        const Eigen::AngleAxisf rot(sgn * alpha * fold * PI_F / 180.0f, axis);
+                        for (int t = 0; t < 2; ++t) {
+                            Vec3f w = qmesh.positions[fv[t]];
+                            Vec3f unf = pa0 + rot * (w - pa0);
+                            Vec3f snap, sn3;
+                            float sd2;
+                            if (ctx.original_bvh.closest_point(unf, snap, sn3, sd2)) unf = snap;
+                            if ((unf - anchor[fv[t]]).norm() > cap_scale * slide_cap[fv[t]]) cap_ok = false;
+                            np[t] = unf;
+                        }
+                        if (!cap_ok) { d_rej_cap++; continue; }
+
+                        const Vec3f save0 = qmesh.positions[fv[0]], save1 = qmesh.positions[fv[1]];
+                        qmesh.positions[fv[0]] = np[0];
+                        qmesh.positions[fv[1]] = np[1];
+                        for (uint32_t f : ms.faces) fnorm[f] = newell(f);
+                        const float crease_after = set_crease_max(ms);
+                        const float sj_after = set_min_sj(ms);
+                        const double area_after = set_area(ms);
+                        const double projected = global_area - area_before + area_after;
+                        const bool area_ok = (projected >= area_lo && projected <= area_hi);
+                        if (crease_after < crease_before - 2.0f && sj_after >= sj_before - 0.01f && area_ok) {
+                            global_area = projected;
+                            moves++;
+                            d_unfold_ok++;
+                            any = true;
+                            unfolded = true;
+                            break;
+                        }
+                        if (dbg) {
+                            if (!area_ok) d_unfold_rej_area++;
+                            else if (sj_after < sj_before - 0.01f) d_unfold_rej_sj++;
+                            else d_unfold_rej_fold++;
+                        }
+                        if (dbg && d_sample < 12) {
+                            d_sample++;
+                            std::cout << "  [t7 unfold] flap=" << flap << " edge(" << a << "," << b << ")"
+                                      << " fold " << crease_before << "->" << crease_after
+                                      << " sj " << sj_before << "->" << sj_after
+                                      << " area_ok=" << (area_ok ? 1 : 0) << std::endl;
+                        }
+                        qmesh.positions[fv[0]] = save0;
+                        qmesh.positions[fv[1]] = save1;
+                        for (uint32_t f : ms.faces) fnorm[f] = newell(f);
+                      }
+                    }
+                }
+            }
+        }
+        if (!any) break;
+    }
+
+    size_t targets_after = 0;
+    for (size_t fi = 0; fi < nf; ++fi)
+        if (is_target[fi] && face_max_dih(static_cast<uint32_t>(fi)) > out_dih_deg) targets_after++;
+
+    std::cout << "[stage6/t7] gate(out>" << out_dih_deg << ",src<" << src_gate_deg
+              << ",R=" << rel << ") src_tris=" << nt
+              << " creased=" << creased << " target_faces=" << targets
+              << " movable_verts=" << n_movable << " iters=" << iters
+              << " moved=" << moves << " targets_left=" << targets_after
+              << " area=" << global_area << std::endl;
+    std::cout << "[stage6/t7/pins] crease_edges=" << crease_edges
+              << " endpoint_movable=" << crease_ep_movable
+              << " pinned_border=" << pin_border << " pinned_sharp=" << pin_sharp
+              << " pinned_valence=" << pin_valence << std::endl;
+    if (dbg) {
+    std::cout << "[stage6/t7/dbg] corners=" << d_corner
+                  << " active=" << d_target_active << " no_fold=" << d_no_fold
+                  << " tiny_h=" << d_tiny_h << " no_bvh=" << d_no_bvh
+                  << " rej_cap=" << d_rej_cap << " rej_dih=" << d_rej_dih
+                  << " rej_sj=" << d_rej_sj << " rej_area=" << d_rej_area
+                  << " refl_try=" << d_unfold_try << " refl_ok=" << d_unfold_ok
+                  << " rej_pin=" << d_rej_pin << " unfold_rej_fold=" << d_unfold_rej_fold
+                  << " unfold_rej_sj=" << d_unfold_rej_sj << " unfold_rej_area=" << d_unfold_rej_area << std::endl;
+    }
+}
+
 void Stage6Optimize::mirror_symmetry(
     RemeshContext& /*ctx*/,
     QuadMeshResult& qmesh,
@@ -1212,9 +1884,11 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     //   QREMESH_RELAX_ITERS=<n>  override relaxation iterations (0 disables it)
     //   QREMESH_NO_HOLEFILL=1    skip hole filling
     //   QREMESH_NO_UNTANGLE=1    skip the untangle pass
+    //   QREMESH_T7=1             localized smooth-crease repair (BUG-01, default OFF)
     int relax_iters = ctx.params->vertex_relax_iters;
     bool skip_holefill = false;
     bool skip_untangle = false;
+    bool t7_localized = false;
     if (const char* env_r = std::getenv("QREMESH_RELAX_ITERS")) {
         relax_iters = std::max(0, std::atoi(env_r));
     }
@@ -1223,6 +1897,9 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     }
     if (const char* env_u = std::getenv("QREMESH_NO_UNTANGLE")) {
         skip_untangle = (std::atoi(env_u) != 0);
+    }
+    if (const char* env_t7 = std::getenv("QREMESH_T7")) {
+        t7_localized = (std::atoi(env_t7) != 0);
     }
 
     // Surface-area timeline: shows which sub-stage inflates the mesh (wrinkles = excess area)
@@ -1529,6 +2206,19 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
         qmesh.material_ids = std::move(keep_mats);
         std::cout << "[stage6/islands] kept=" << qmesh.polygons.size() << " dropped=" << dropped
                   << " thresh=" << thresh << " largest=" << largest << std::endl;
+    }
+
+    // T7 (BUG-01): localized smooth-crease repair. Runs LAST on geometry (after the final
+    // fill + island policy, before the quality report) and only on the analytic target mask
+    // (creased output x locally smooth source). Opt-in: default OFF keeps the baseline
+    // bit-identical. Interior grid nodes only - borders (Dirichlet) and feature edges pinned.
+    if (t7_localized) {
+        localized_smooth_crease_repair(ctx, qmesh);
+        log_area("after_t7");
+        if (ctx.active_symmetry_axis >= 0 && ctx.active_symmetry_axis <= 2) {
+            float tol = ctx.params->symmetry_tolerance * 0.01f * ctx.bbox_diag;
+            mirror_symmetry(ctx, qmesh, ctx.active_symmetry_axis, tol);
+        }
     }
 
     compute_final_quality_report(ctx, qmesh);

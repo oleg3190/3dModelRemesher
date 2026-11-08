@@ -36,6 +36,12 @@ private:
         QuadMeshResult& qmesh
     );
 
+    // T7 (BUG-01): localized smooth-crease repair driven by an analytic target mask.
+    static void localized_smooth_crease_repair(
+        RemeshContext& ctx,
+        QuadMeshResult& qmesh
+    );
+
     static void mirror_symmetry(
         RemeshContext& ctx,
         QuadMeshResult& qmesh,
