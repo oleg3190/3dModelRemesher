@@ -27,6 +27,14 @@ private:
         QuadMeshResult& out_quads
     );
 
+    // T16: monotone re-lay of a patch's interior grid nodes (borders stay Dirichlet).
+    static void untangle_patch_grids(
+        RemeshContext& ctx,
+        QuadMeshResult& out_quads,
+        const std::vector<uint32_t>& face_patch,
+        const std::vector<uint32_t>& patches
+    );
+
     static void weld_and_inherit_attributes(
         RemeshContext& ctx,
         QuadMeshResult& out_quads

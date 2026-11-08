@@ -203,6 +203,10 @@ def main():
         "out_dih": a.out_dih, "src_rough_gate": a.src_rough,
         "creased_out": int(len(creased)),
         "smooth_creases": int(len(smooth)),
+        # Normalized: the raw count grows with the face count, so comparing budgets with it is
+        # wrong (measured: 127 @9.2k faces, 210 @18.6k, 186 @27.6k - the RATE falls 1.38%->1.13%
+        # ->0.67% while the count rises). Use smooth_creases_per_kfaces for resolution studies.
+        "smooth_creases_per_kfaces": 1000.0 * len(smooth) / max(1, len(po)),
         "target_verts": int(len(targets)),
         "winding_conflicts": winding_conflicts(po),
         "src_winding_conflicts": winding_conflicts(ps),

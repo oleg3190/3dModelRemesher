@@ -1,5 +1,6 @@
 #include "stages/stage5_param.h"
 #include <Eigen/Sparse>
+#include <Eigen/Eigenvalues>
 #include <Eigen/IterativeLinearSolvers>
 #include <unordered_map>
 #include <unordered_set>
@@ -12,6 +13,27 @@
 #include <iostream>
 
 namespace qremesh {
+
+namespace {
+// Scaled Jacobian of a quad - same convention as Stage6Optimize::compute_scaled_jacobian, kept
+// local so stage5 does not depend on a stage6 class.
+float sj5(const Vec3f& p0, const Vec3f& p1, const Vec3f& p2, const Vec3f& p3) {
+    const Vec3f pts[4] = { p0, p1, p2, p3 };
+    Vec3f n = (p2 - p0).cross(p3 - p1);
+    if (n.squaredNorm() < 1e-16f) return -1.0f;
+    n.normalize();
+    float min_j = 1.0f;
+    for (int i = 0; i < 4; ++i) {
+        Vec3f e1 = pts[(i + 1) % 4] - pts[i];
+        Vec3f e2 = pts[(i + 3) % 4] - pts[i];
+        const float l1 = e1.norm(), l2 = e2.norm();
+        if (l1 < 1e-8f || l2 < 1e-8f) return -1.0f;
+        min_j = std::min(min_j, (e1 / l1).cross(e2 / l2).dot(n));
+    }
+    return min_j;
+}
+} // namespace
+
 
 namespace {
 // Diagnostic counters for one extraction pass
@@ -1402,6 +1424,325 @@ void Stage5ParamAndExtract::weld_and_inherit_attributes(
     out_quads.material_ids = std::move(valid_mats);
 }
 
+// ---------------------------------------------------------------------------
+// T16: monotone re-lay of the interior nodes of a patch grid.
+//
+// Why this exists (measured in the [stage5/overlapmap] census): 102 of the 132 patches that hold
+// a fold show BOTH >3% double-covered and >3% uncovered area inside their own border region -
+// the grid does not tile its own border, it overlaps some cells and skips others. Border vertices
+// are already shared between the two patches, so they must not move (invariant #5: both neighbours
+// need the identical sample set); the only free DOF are the patch's INTERIOR nodes. Those are
+// exactly the DOF that decide whether the tiling is monotone.
+//
+// Method: solve the grid in the patch's own plane - discrete Laplacian on interior nodes with the
+// border held fixed (Dirichlet), sweeping until the 2D overlap measure stops improving while no
+// cell may turn inside out (positive signed area for every fan triangle). A planar harmonic map of
+// a disk with a simple boundary is the standard non-overlapping fill, which is what Coons-by-index
+// fails to be on these borders. Then the improved planar positions are mapped back onto the source
+// surface (closest_point, invariant #7) under a travel cap, and the patch is only kept if its
+// fold census and its worst quad both got no worse. Deterministic: fixed sweep order over sorted
+// vertex indices.
+// ---------------------------------------------------------------------------
+void Stage5ParamAndExtract::untangle_patch_grids(
+    RemeshContext& ctx,
+    QuadMeshResult& out_quads,
+    const std::vector<uint32_t>& face_patch,
+    const std::vector<uint32_t>& patches
+) {
+    if (patches.empty()) return;
+    const size_t nf = out_quads.polygons.size();
+    const size_t nv = out_quads.positions.size();
+    if (nv == 0 || nf == 0) return;
+
+    auto key2 = [](uint32_t a, uint32_t b) -> uint64_t {
+        return (static_cast<uint64_t>(std::min(a, b)) << 32) | static_cast<uint32_t>(std::max(a, b));
+    };
+    auto newell = [&](const std::vector<uint32_t>& q) -> Vec3f {
+        Vec3d n = Vec3d::Zero();
+        const size_t pn = q.size();
+        for (size_t i = 0; i < pn; ++i) {
+            Vec3d a = out_quads.positions[q[i]].cast<double>();
+            Vec3d b = out_quads.positions[q[(i + 1) % pn]].cast<double>();
+            n += a.cross(b);
+        }
+        const double ln = n.norm();
+        return ln > 1e-14 ? (n / ln).cast<float>() : Vec3f(0, 0, 0);
+    };
+    // fold census restricted to a set of faces: two faces of the set sharing an edge, normal angle
+    // > 120 deg and free vertices on the SAME side of that edge
+    auto count_folds = [&](const std::vector<uint32_t>& faces) -> size_t {
+        struct ER { uint32_t f0, f1, w0, w1; };
+        std::unordered_map<uint64_t, ER> em;
+        for (uint32_t fi : faces) {
+            const auto& q = out_quads.polygons[fi];
+            const size_t pn = q.size();
+            for (size_t i = 0; i < pn; ++i) {
+                uint32_t a = q[i], b = q[(i + 1) % pn];
+                if (a == b) continue;
+                uint32_t free_v = INVALID_INDEX;
+                for (size_t k = 0; k < pn; ++k)
+                    if (q[k] != a && q[k] != b) { free_v = q[k]; break; }
+                uint64_t k2 = key2(a, b);
+                auto it = em.find(k2);
+                if (it == em.end()) em.emplace(k2, ER{fi, INVALID_INDEX, free_v, INVALID_INDEX});
+                else if (it->second.f1 == INVALID_INDEX) { it->second.f1 = fi; it->second.w1 = free_v; }
+            }
+        }
+        std::unordered_map<uint32_t, Vec3f> fn;
+        for (uint32_t fi : faces) fn[fi] = newell(out_quads.polygons[fi]);
+        size_t folds = 0;
+        for (const auto& [k2, r] : em) {
+            if (r.f1 == INVALID_INDEX || r.w0 == INVALID_INDEX || r.w1 == INVALID_INDEX) continue;
+            const Vec3f n0 = fn[r.f0], n1 = fn[r.f1];
+            const float dih = std::acos(std::max(-1.0f, std::min(1.0f, n0.dot(n1)))) * 180.0f / PI_F;
+            if (dih <= 120.0f) continue;
+            const uint32_t a = static_cast<uint32_t>(k2 >> 32), b = static_cast<uint32_t>(k2 & 0xFFFFFFFFu);
+            Vec3f e = out_quads.positions[b] - out_quads.positions[a];
+            const float el = e.norm();
+            if (el < 1e-9f) continue;
+            e /= el;
+            const Vec3f mid = 0.5f * (out_quads.positions[a] + out_quads.positions[b]);
+            Vec3f u0 = out_quads.positions[r.w0] - mid, u1 = out_quads.positions[r.w1] - mid;
+            u0 -= u0.dot(e) * e;
+            u1 -= u1.dot(e) * e;
+            if (u0.dot(u1) > 0.0f) folds++;
+        }
+        return folds;
+    };
+
+    // vertex -> faces, and the median edge of the whole mesh (travel cap reference)
+    std::vector<std::vector<uint32_t>> vfaces(nv);
+    std::vector<float> all_len;
+    all_len.reserve(nf * 4);
+    for (size_t fi = 0; fi < nf; ++fi) {
+        const auto& q = out_quads.polygons[fi];
+        const size_t pn = q.size();
+        for (size_t i = 0; i < pn; ++i) {
+            uint32_t a = q[i], b = q[(i + 1) % pn];
+            if (a < nv) vfaces[a].push_back(static_cast<uint32_t>(fi));
+            if (a < nv && b < nv && a != b)
+                all_len.push_back((out_quads.positions[a] - out_quads.positions[b]).norm());
+        }
+    }
+    std::nth_element(all_len.begin(), all_len.begin() + all_len.size() / 2, all_len.end());
+    const float med_e = all_len.empty() ? 1.0f : all_len[all_len.size() / 2];
+
+    bool t16_snap = true;
+    if (const char* e = std::getenv("QREMESH_T16_SNAP")) t16_snap = (std::atoi(e) != 0);
+    size_t fixed_patches = 0, skipped_nointerior = 0, reverted = 0;
+    size_t r_nocand = 0, r_folds = 0, r_sj = 0, r_noimprove = 0;
+    size_t folds_before_total = 0, folds_after_total = 0;
+
+    for (uint32_t p : patches) {
+        std::vector<uint32_t> faces;
+        for (size_t fi = 0; fi < nf; ++fi) if (face_patch[fi] == p) faces.push_back(static_cast<uint32_t>(fi));
+        if (faces.size() < 2) continue;
+
+        std::unordered_set<uint32_t> vset;
+        for (uint32_t fi : faces) for (uint32_t v : out_quads.polygons[fi]) vset.insert(v);
+        // patch-local adjacency
+        std::vector<uint32_t> verts(vset.begin(), vset.end());
+        std::sort(verts.begin(), verts.end());
+        std::unordered_map<uint32_t, size_t> vpos;
+        for (size_t i = 0; i < verts.size(); ++i) vpos[verts[i]] = i;
+        std::vector<std::vector<size_t>> nbr(verts.size());
+        for (uint32_t fi : faces) {
+            const auto& q = out_quads.polygons[fi];
+            const size_t pn = q.size();
+            for (size_t i = 0; i < pn; ++i) {
+                uint32_t a = q[i], b = q[(i + 1) % pn];
+                if (a == b) continue;
+                const size_t ia = vpos[a], ib = vpos[b];
+                nbr[ia].push_back(ib);
+                nbr[ib].push_back(ia);
+            }
+        }
+        for (auto& v : nbr) {
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+        // interior = a vertex whose every incident face belongs to this patch
+        std::vector<uint8_t> interior(verts.size(), 0);
+        for (size_t i = 0; i < verts.size(); ++i) {
+            const uint32_t v = verts[i];
+            bool only_here = !vfaces[v].empty();
+            for (uint32_t fi : vfaces[v]) if (fi >= nf || face_patch[fi] != p) { only_here = false; break; }
+            interior[i] = only_here ? 1 : 0;
+        }
+        size_t n_interior = 0;
+        for (size_t i = 0; i < verts.size(); ++i) n_interior += interior[i] ? 1 : 0;
+        if (n_interior == 0) { skipped_nointerior++; continue; }   // 2x2 grid: nothing to re-lay
+
+        // The fold census must include the SEAM: 55% of folds are between two patches (S45), so
+        // judging a re-lay only on the patch's own faces would accept moves that shift the fold
+        // across the border instead of removing it. Add the 1-ring of foreign faces.
+        std::unordered_map<uint64_t, std::vector<uint32_t>> face_edge_map;
+        for (uint32_t fi : faces) {
+            const auto& q = out_quads.polygons[fi];
+            const size_t pn = q.size();
+            for (size_t i = 0; i < pn; ++i) {
+                uint32_t a = q[i], b = q[(i + 1) % pn];
+                if (a != b) face_edge_map[key2(a, b)].push_back(fi);
+            }
+        }
+        std::vector<uint32_t> scope = faces;
+        {
+            std::unordered_set<uint32_t> in_scope(faces.begin(), faces.end());
+            for (const auto& [k2, fl] : face_edge_map) {
+                for (uint32_t g : fl) {
+                    if (g < nf && face_patch[g] != p && in_scope.insert(g).second) scope.push_back(g);
+                }
+            }
+            std::sort(scope.begin(), scope.end());
+        }
+        const size_t folds_before = count_folds(scope);
+        folds_before_total += folds_before;
+
+        // patch plane
+        Vec3d cen = Vec3d::Zero();
+        for (uint32_t v : verts) cen += out_quads.positions[v].cast<double>();
+        cen /= static_cast<double>(verts.size());
+        Mat3d cov = Mat3d::Zero();
+        for (uint32_t v : verts) { Vec3d d = out_quads.positions[v].cast<double>() - cen; cov += d * d.transpose(); }
+        Eigen::SelfAdjointEigenSolver<Mat3d> es(cov);
+        const Vec3d ax1 = es.eigenvectors().col(2), ax2 = es.eigenvectors().col(1);
+        std::vector<std::pair<double, double>> xy(verts.size());
+        std::vector<Vec3f> xyz(verts.size());
+        for (size_t i = 0; i < verts.size(); ++i) {
+            Vec3d d = out_quads.positions[verts[i]].cast<double>() - cen;
+            xy[i] = { d.dot(ax1), d.dot(ax2) };
+            xyz[i] = out_quads.positions[verts[i]];
+        }
+
+        auto measure = [&](const std::vector<std::pair<double, double>>& X, bool& any_inverted) -> double {
+            // 2D overlap fraction over a coarse raster of the patch, plus inverted-cell detection
+            any_inverted = false;
+            double lo1 = 1e30, hi1 = -1e30, lo2 = 1e30, hi2 = -1e30;
+            for (auto& q : X) { lo1 = std::min(lo1, q.first); hi1 = std::max(hi1, q.first);
+                                 lo2 = std::min(lo2, q.second); hi2 = std::max(hi2, q.second); }
+            const int RES = 24;
+            const double s1 = (hi1 - lo1) > 1e-12 ? RES / (hi1 - lo1) : 1.0;
+            const double s2 = (hi2 - lo2) > 1e-12 ? RES / (hi2 - lo2) : 1.0;
+            std::vector<uint8_t> cov2(RES * RES, 0);
+            for (uint32_t fi : faces) {
+                const auto& q = out_quads.polygons[fi];
+                for (size_t i = 1; i + 1 < q.size(); ++i) {
+                    const auto A = X[vpos[q[0]]], B = X[vpos[q[i]]], C = X[vpos[q[i + 1]]];
+                    const double ar = 0.5 * ((B.first - A.first) * (C.second - A.second) -
+                                             (C.first - A.first) * (B.second - A.second));
+                    if (std::abs(ar) < 1e-16) continue;
+                    if (ar < 0.0) any_inverted = true;
+                    double mnx = std::min({A.first, B.first, C.first}), mxx = std::max({A.first, B.first, C.first});
+                    double mny = std::min({A.second, B.second, C.second}), mxy = std::max({A.second, B.second, C.second});
+                    const int x0 = std::max(0, static_cast<int>((mnx - lo1) * s1));
+                    const int x1 = std::min(RES - 1, static_cast<int>((mxx - lo1) * s1));
+                    const int y0 = std::max(0, static_cast<int>((mny - lo2) * s2));
+                    const int y1 = std::min(RES - 1, static_cast<int>((mxy - lo2) * s2));
+                    const double d2 = 2.0 * ar;
+                    for (int yy = y0; yy <= y1; ++yy)
+                        for (int xx = x0; xx <= x1; ++xx) {
+                            const double px = lo1 + (xx + 0.5) / s1, py = lo2 + (yy + 0.5) / s2;
+                            const double w0 = ((B.second - C.second) * (px - C.first) + (C.first - B.first) * (py - C.second)) / d2;
+                            const double w1 = ((C.second - A.second) * (px - C.first) + (A.first - C.first) * (py - C.second)) / d2;
+                            const double w2 = 1.0 - w0 - w1;
+                            if (w0 >= -1e-9 && w1 >= -1e-9 && w2 >= -1e-9) {
+                                uint8_t& c = cov2[yy * RES + xx];
+                                if (c < 255) c++;
+                            }
+                        }
+                }
+            }
+            long single = 0, multi = 0;
+            for (uint8_t c : cov2) { if (c == 1) single++; else if (c >= 2) multi++; }
+            const long tot = single + multi;
+            return tot > 0 ? static_cast<double>(multi) / tot : 0.0;
+        };
+
+        bool inv0 = false;
+        double best_score = measure(xy, inv0) + (inv0 ? 1.0 : 0.0);
+        auto best_xy = xy;
+        auto cur = xy;
+        for (int sweep = 0; sweep < 120; ++sweep) {
+            for (size_t i = 0; i < verts.size(); ++i) {
+                if (!interior[i] || nbr[i].empty()) continue;
+                double sx = 0.0, sy = 0.0;
+                for (size_t j : nbr[i]) { sx += cur[j].first; sy += cur[j].second; }
+                cur[i] = { sx / static_cast<double>(nbr[i].size()), sy / static_cast<double>(nbr[i].size()) };
+            }
+            bool inv = false;
+            const double ov = measure(cur, inv);
+            const double score = ov + (inv ? 1.0 : 0.0);
+            if (score < best_score - 1e-6) { best_score = score; best_xy = cur; }
+            if (ov <= 0.005 && !inv) break;      // monotone tiling reached
+        }
+        if (best_score >= measure(xy, inv0) + (inv0 ? 1.0 : 0.0) - 1e-9) { reverted++; r_noimprove++; continue; }
+
+        // map the improved planar positions back into 3D and onto the source
+        std::vector<uint32_t> moved_ids;
+        std::vector<Vec3f> moved_pos;
+        for (size_t i = 0; i < verts.size(); ++i) {
+            if (!interior[i]) continue;
+            Vec3d nd = best_xy[i].first * ax1 + best_xy[i].second * ax2;
+            Vec3f cand = (cen + nd).cast<float>();
+            // Snap back onto the source by default (invariant #7). QREMESH_T16_SNAP=0 keeps the
+            // planar position: the re-projected node can land on the OTHER sheet of a fold and
+            // put the crease back, which is what made 79 of 102 candidates revert.
+            if (t16_snap) {
+                Vec3f snap, nrm; float d2;
+                if (ctx.original_bvh.closest_point(cand, snap, nrm, d2)) cand = snap;
+            }
+            const float travel = (cand - xyz[i]).norm();
+            if (travel > 1.5f * med_e) continue;                     // anti-migration
+            moved_ids.push_back(verts[i]);
+            moved_pos.push_back(cand);
+        }
+        if (moved_ids.empty()) { reverted++; r_nocand++; continue; }
+
+        const std::vector<Vec3f> backup_pos = out_quads.positions;
+        for (size_t i = 0; i < moved_ids.size(); ++i) out_quads.positions[moved_ids[i]] = moved_pos[i];
+
+        const size_t folds_after = count_folds(scope);
+        float sj_min_before = 1.0f, sj_min_after = 1.0f;
+        for (uint32_t fi : faces) {
+            const auto& q = out_quads.polygons[fi];
+            if (q.size() != 4) continue;
+            sj_min_after = std::min(sj_min_after, sj5(
+                out_quads.positions[q[0]], out_quads.positions[q[1]],
+                out_quads.positions[q[2]], out_quads.positions[q[3]]));
+        }
+        out_quads.positions = backup_pos;
+        for (uint32_t fi : faces) {
+            const auto& q = out_quads.polygons[fi];
+            if (q.size() != 4) continue;
+            sj_min_before = std::min(sj_min_before, sj5(
+                out_quads.positions[q[0]], out_quads.positions[q[1]],
+                out_quads.positions[q[2]], out_quads.positions[q[3]]));
+        }
+        // apply for real only if it is a strict improvement
+        for (size_t i = 0; i < moved_ids.size(); ++i) out_quads.positions[moved_ids[i]] = moved_pos[i];
+        if (folds_after > folds_before) {
+            out_quads.positions = backup_pos;
+            reverted++; r_folds++;
+            continue;
+        }
+        if (sj_min_after < sj_min_before - 1e-3f) {
+            out_quads.positions = backup_pos;
+            reverted++; r_sj++;
+            continue;
+        }
+        folds_after_total += folds_after;
+        fixed_patches++;
+    }
+
+    std::cout << "[stage5/untangle] candidates=" << patches.size() << " relaid=" << fixed_patches
+              << " no_interior=" << skipped_nointerior << " reverted=" << reverted
+              << " rej(no_improve=" << r_noimprove << " no_move=" << r_nocand
+              << " folds_up=" << r_folds << " sj_worse=" << r_sj << ")"
+              << " snap=" << (t16_snap ? 1 : 0)
+              << " folds_in_candidates " << folds_before_total << "->" << folds_after_total
+              << std::endl;
+}
+
 QrmStatus Stage5ParamAndExtract::execute(
     RemeshContext& ctx,
     PatchGraph& graph,
@@ -1423,6 +1764,11 @@ QrmStatus Stage5ParamAndExtract::execute(
     int64_t prev_actual = -1;
     size_t empty_loops = 0, short_loops = 0, loop_paths_total = 0, quads_from_loops = 0;
     int64_t polys_before_weld = 0, verts_before_weld = 0;
+
+    // Survive the calibration passes: the last pass is the shipped mesh, and the T16 re-lay runs
+    // after the loop, so both the face->patch attribution and the candidate list live out here.
+    std::vector<uint32_t> face_patch;
+    std::vector<uint32_t> t16_candidates;
 
     for (int calib = 0; calib < 3; ++calib) {
     balance_and_quantize_patch_sizes(ctx, graph, search_eff);
@@ -1599,7 +1945,7 @@ QrmStatus Stage5ParamAndExtract::execute(
 
     // Diagnostic for S45 (where do the folds come from): face -> patch attribution, so a pleat
     // edge can be classified as INTRA-patch (the fill itself folds) or CROSS-patch (a seam).
-    std::vector<uint32_t> face_patch;
+    face_patch.clear();
     for (size_t p = 0; p < graph.patches.size(); ++p) {
         const auto& patch = graph.patches[p];
         size_t before = out_quads.polygons.size();
@@ -1691,6 +2037,163 @@ QrmStatus Stage5ParamAndExtract::execute(
                   << "/" << graph.patches.size()
                   << " worst_patch=" << worst_p << "(" << worst_n << ")"
                   << " giniish_sum_sq=" << sum_sq << std::endl;
+
+        // ---- T16 premise test: does a patch that folds also OVERLAP ITSELF? ------------------
+        // A fold pair lies on the same side of its shared edge, so if the patch grid were merely
+        // "wavy" the cells would still tile the patch's own border region. If instead
+        // sum(quad areas) > area(hull of the patch's own vertices) the grid covers part of its
+        // border twice and leaves another part uncovered - which is exactly what a monotone
+        // re-fill can fix (and what no vertex smoothing can, because the vertices are already
+        // on the surface). Measured per patch, correlated with the pleat census above.
+        size_t overlap_patches = 0, pleated_overlap = 0, pleated_clean = 0;
+        t16_candidates.clear();
+        double worst_ratio = 0.0; uint32_t worst_ratio_patch = INVALID_INDEX;
+        std::vector<std::vector<uint32_t>> faces_of_patch(graph.patches.size());
+        for (size_t fi = 0; fi < face_patch.size(); ++fi)
+            if (face_patch[fi] < faces_of_patch.size()) faces_of_patch[face_patch[fi]].push_back(static_cast<uint32_t>(fi));
+        for (size_t p = 0; p < graph.patches.size(); ++p) {
+            const std::vector<uint32_t>& mine = faces_of_patch[p];
+            if (mine.size() < 2) continue;
+            // PCA plane of the patch's own vertices
+            Vec3d cen = Vec3d::Zero();
+            std::vector<uint32_t> verts;
+            { std::unordered_set<uint32_t> s;
+              for (uint32_t fi : mine) for (uint32_t v : out_quads.polygons[fi]) s.insert(v);
+              verts.assign(s.begin(), s.end());
+              std::sort(verts.begin(), verts.end());
+              for (uint32_t v : verts) cen += POS[v].cast<double>();
+              cen /= static_cast<double>(verts.size()); }
+            Mat3d cov = Mat3d::Zero();
+            for (uint32_t v : verts) { Vec3d d = POS[v].cast<double>() - cen; cov += d * d.transpose(); }
+            Eigen::SelfAdjointEigenSolver<Mat3d> es(cov);
+            Vec3d ax1 = es.eigenvectors().col(2), ax2 = es.eigenvectors().col(1);
+            auto proj = [&](uint32_t v) -> std::pair<double, double> {
+                Vec3d d = POS[v].cast<double>() - cen;
+                return { d.dot(ax1), d.dot(ax2) };
+            };
+            double sum_area = 0.0;
+            for (uint32_t fi : mine) {
+                const auto& q = out_quads.polygons[fi];
+                double a = 0.0;
+                for (size_t i = 1; i + 1 < q.size(); ++i) {
+                    auto A = proj(q[0]), B = proj(q[i]), D = proj(q[i + 1]);
+                    a += 0.5 * std::abs((B.first - A.first) * (D.second - A.second) -
+                                        (D.first - A.first) * (B.second - A.second));
+                }
+                sum_area += a;
+            }
+            // convex hull area (Andrew monotone chain) of the patch's projected vertices
+            using P2 = std::pair<double, double>;
+            std::vector<P2> pts;
+            pts.reserve(verts.size());
+            for (uint32_t v : verts) pts.push_back(proj(v));
+            std::sort(pts.begin(), pts.end());
+            auto cross2 = [](const P2& o, const P2& a, const P2& b) {
+                return (a.first - o.first) * (b.second - o.second) -
+                       (a.second - o.second) * (b.first - o.first);
+            };
+            std::vector<P2> lower, upper;
+            for (const P2& q : pts) {
+                while (lower.size() >= 2 && cross2(lower[lower.size() - 2], lower.back(), q) <= 0.0)
+                    lower.pop_back();
+                lower.push_back(q);
+            }
+            for (size_t i = pts.size(); i-- > 0;) {
+                const P2& q = pts[i];
+                while (upper.size() >= 2 && cross2(upper[upper.size() - 2], upper.back(), q) <= 0.0)
+                    upper.pop_back();
+                upper.push_back(q);
+            }
+            std::vector<P2> hull;
+            hull.insert(hull.end(), lower.begin(), lower.end());
+            hull.insert(hull.end(), upper.begin() + 1, upper.end() - 1);
+            double hull_area = 0.0;
+            for (size_t i = 0; i + 2 < hull.size(); ++i) {
+                hull_area += 0.5 * std::abs((hull[i + 1].first - hull[0].first) * (hull[i + 2].second - hull[0].second) -
+                                            (hull[i + 2].first - hull[0].first) * (hull[i + 1].second - hull[0].second));
+            }
+            if (hull_area <= 1e-12) continue;
+            const double ratio = sum_area / hull_area;
+
+            // Raster census (the sharp version of the ratio test above): a fold that overlaps a
+            // neighbour can be exactly compensated by an equal uncovered gap, so sum==hull proves
+            // nothing. Rasterize the patch's own quads on a 2D grid in its PCA plane and count
+            // cells covered 2+ times (overlap) and cells inside the border covered 0 times (gap).
+            // monotone re-fill can only help if BOTH are present.
+            double lo1 = 1e30, hi1 = -1e30, lo2 = 1e30, hi2 = -1e30;
+            for (uint32_t v : verts) {
+                auto q = proj(v);
+                lo1 = std::min(lo1, q.first); hi1 = std::max(hi1, q.first);
+                lo2 = std::min(lo2, q.second); hi2 = std::max(hi2, q.second);
+            }
+            const int RES = 40;
+            const double sc1 = (hi1 - lo1) > 1e-12 ? static_cast<double>(RES) / (hi1 - lo1) : 1.0;
+            const double sc2 = (hi2 - lo2) > 1e-12 ? static_cast<double>(RES) / (hi2 - lo2) : 1.0;
+            std::vector<uint8_t> cover(RES * RES, 0);        // patch quads
+            std::vector<uint8_t> inside(RES * RES, 0);       // border polygon (hull) fill
+            auto fill_tri = [&](const P2& a, const P2& b, const P2& c, std::vector<uint8_t>& dst,
+                                bool increment) {
+                double mnx = std::min({a.first, b.first, c.first});
+                double mxx = std::max({a.first, b.first, c.first});
+                double mny = std::min({a.second, b.second, c.second});
+                double mxy = std::max({a.second, b.second, c.second});
+                const int x0 = std::max(0, static_cast<int>((mnx - lo1) * sc1));
+                const int x1 = std::min(RES - 1, static_cast<int>((mxx - lo1) * sc1));
+                const int y0 = std::max(0, static_cast<int>((mny - lo2) * sc2));
+                const int y1 = std::min(RES - 1, static_cast<int>((mxy - lo2) * sc2));
+                const double d = (b.second - c.second) * (a.first - c.first) +
+                                 (c.first - b.first) * (a.second - c.second);
+                if (std::abs(d) < 1e-18) return;
+                for (int yy = y0; yy <= y1; ++yy)
+                    for (int xx = x0; xx <= x1; ++xx) {
+                        const double px = lo1 + (xx + 0.5) / sc1;
+                        const double py = lo2 + (yy + 0.5) / sc2;
+                        const double w0 = ((b.second - c.second) * (px - c.first) +
+                                          (c.first - b.first) * (py - c.second)) / d;
+                        const double w1 = ((c.second - a.second) * (px - c.first) +
+                                          (a.first - c.first) * (py - c.second)) / d;
+                        const double w2 = 1.0 - w0 - w1;
+                        if (w0 >= -1e-9 && w1 >= -1e-9 && w2 >= -1e-9) {
+                            int id = yy * RES + xx;
+                            if (increment) { if (dst[id] < 255) dst[id]++; } else dst[id] = 1;
+                        }
+                    }
+            };
+            for (uint32_t fi : mine) {
+                const auto& q = out_quads.polygons[fi];
+                for (size_t i = 1; i + 1 < q.size(); ++i)
+                    fill_tri(proj(q[0]), proj(q[i]), proj(q[i + 1]), cover, true);
+            }
+            for (size_t i = 0; i + 2 < hull.size(); ++i)
+                fill_tri(hull[0], hull[i + 1], hull[i + 2], inside, false);
+            long n_double = 0, n_gap = 0, n_ok = 0;
+            for (int i = 0; i < RES * RES; ++i) {
+                if (!inside[i]) continue;
+                if (cover[i] == 0) n_gap++;
+                else if (cover[i] >= 2) n_double++;
+                else n_ok++;
+            }
+            const long inside_cells = n_gap + n_double + n_ok;
+            if (inside_cells >= 8) {
+                const double ov = static_cast<double>(n_double) / inside_cells;
+                const double gp = static_cast<double>(n_gap) / inside_cells;
+                if (ov > 0.03 && gp > 0.03) overlap_patches++;
+                const bool pleated0 = per_patch.count(static_cast<uint32_t>(p)) > 0;
+                if (pleated0) {
+                    if (ov > 0.03 && gp > 0.03) { pleated_overlap++; t16_candidates.push_back(static_cast<uint32_t>(p)); }
+                    else pleated_clean++;
+                }
+                if (ov + gp > worst_ratio) { worst_ratio = ov + gp; worst_ratio_patch = static_cast<uint32_t>(p); }
+            }
+            const bool overlapped = false;   // (superseded by the raster test above)
+            (void)overlapped; (void)ratio;
+        }
+        std::cout << "[stage5/overlapmap] patches=" << graph.patches.size()
+                  << " overlap_AND_gap_gt3%=" << overlap_patches
+                  << " pleated&both=" << pleated_overlap
+                  << " pleated&clean=" << pleated_clean
+                  << " worst_overlap_plus_gap=" << worst_ratio << " (patch " << worst_ratio_patch << ")"
+                  << std::endl;
     }
 
     polys_before_weld = static_cast<int64_t>(out_quads.polygons.size());
@@ -1746,6 +2249,15 @@ QrmStatus Stage5ParamAndExtract::execute(
 
     if (out_quads.polygons.empty()) {
         return QRM_ERR_PARAM_FAILED;
+    }
+
+    // T16 (BUG-01): monotone re-lay of the interior nodes of the patches whose own border region
+    // is over- AND under-covered (the census above). Borders are Dirichlet, so seams and welding
+    // are untouched. Default OFF: QREMESH_T16=0 disables, baseline stays bit-identical.
+    if (const char* e = std::getenv("QREMESH_T16")) {
+        if (std::atoi(e) != 0) {
+            untangle_patch_grids(ctx, out_quads, face_patch, t16_candidates);
+        }
     }
 
     weld_and_inherit_attributes(ctx, out_quads);
