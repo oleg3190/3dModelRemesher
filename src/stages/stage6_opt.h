@@ -49,6 +49,12 @@ private:
         float ratio
     );
 
+    // T9: re-wind faces whose traversal disagrees with the mesh majority (no vertex moves).
+    static void rewind_inconsistent_faces(
+        RemeshContext& ctx,
+        QuadMeshResult& qmesh
+    );
+
     static void mirror_symmetry(
         RemeshContext& ctx,
         QuadMeshResult& qmesh,

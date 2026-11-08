@@ -2075,6 +2075,158 @@ void Stage6Optimize::collapse_degenerate_edges(
               << " verts " << nv << "->" << qmesh.positions.size() << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// T9: re-wind the faces whose traversal disagrees with the orientation majority.
+//
+// Measured on the shipped baseline (test_out/quality_10k.obj): 200 interior edges are traversed in
+// the SAME direction by both faces, touching 234 faces, 138 of which have a normal opposing the
+// majority of their ring. In a render those are dark / inside-out facets - and they also poison
+// every signed metric: the T7 detector reads a ~180 deg "crease" for a flat pair with flipped
+// winding, which is why the winding audit had to be added to that pass (S42b).
+//
+// The fix moves nothing. Colour the dual graph so that a consistent edge demands equal colours and
+// a conflicting edge demands opposite ones (2-colouring); per connected component keep the minority
+// assignment if it is smaller than the majority, then reverse the polygon order of the faces marked
+// -1. Odd parity cycles cannot be fixed by re-winding (they are genuine non-orientable junctions),
+// so the residual is reported instead of hidden.
+// ---------------------------------------------------------------------------
+void Stage6Optimize::rewind_inconsistent_faces(RemeshContext& /*ctx*/, QuadMeshResult& qmesh) {
+    const size_t nf = qmesh.polygons.size();
+    if (nf < 2) return;
+
+    auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+        return (static_cast<uint64_t>(std::min(a, b)) << 32) | static_cast<uint32_t>(std::max(a, b));
+    };
+    struct Rec { uint32_t f0 = INVALID_INDEX, f1 = INVALID_INDEX; int8_t d0 = 0, d1 = 0; };
+    std::unordered_map<uint64_t, Rec> edges;
+    std::unordered_set<uint64_t> over2;
+    edges.reserve(nf * 2);
+
+    for (size_t fi = 0; fi < nf; ++fi) {
+        const auto& q = qmesh.polygons[fi];
+        const size_t pn = q.size();
+        if (pn < 3) continue;
+        for (size_t i = 0; i < pn; ++i) {
+            uint32_t a = q[i], b = q[(i + 1) % pn];
+            if (a == b || a >= qmesh.positions.size() || b >= qmesh.positions.size()) continue;
+            const uint64_t k = ekey(a, b);
+            const int8_t dir = (a < b) ? 1 : -1;
+            auto it = edges.find(k);
+            if (it == edges.end()) {
+                Rec r; r.f0 = static_cast<uint32_t>(fi); r.d0 = dir;
+                edges.emplace(k, r);
+            } else if (it->second.f1 == INVALID_INDEX && !over2.count(k)) {
+                if (it->second.f0 != static_cast<uint32_t>(fi)) {
+                    it->second.f1 = static_cast<uint32_t>(fi);
+                    it->second.d1 = dir;
+                }
+            } else {
+                over2.insert(k);
+            }
+        }
+    }
+
+    auto count_conflicts = [&]() -> size_t {
+        size_t c = 0;
+        for (const auto& [k, r] : edges) {
+            if (r.f0 == INVALID_INDEX || r.f1 == INVALID_INDEX || over2.count(k)) continue;
+            if (r.d0 == r.d1) c++;
+        }
+        return c;
+    };
+    const size_t conflicts_before = count_conflicts();
+    if (conflicts_before == 0) {
+        std::cout << "[stage6/rewind] already consistent (conflicts=0)" << std::endl;
+        return;
+    }
+
+    // dual graph with parity: opposite colours demanded across an already-conflicting edge
+    std::vector<std::vector<std::pair<uint32_t, int8_t>>> adj(nf);
+    for (const auto& [k, r] : edges) {
+        if (r.f0 == INVALID_INDEX || r.f1 == INVALID_INDEX || over2.count(k)) continue;
+        const int8_t parity = (r.d0 == r.d1) ? -1 : 1;   // colour[other] = colour[this] * parity
+        adj[r.f0].push_back({r.f1, parity});
+        adj[r.f1].push_back({r.f0, parity});
+    }
+    for (auto& l : adj)
+        std::sort(l.begin(), l.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::vector<int8_t> color(nf, 0);
+    std::vector<std::vector<uint32_t>> components;
+    size_t odd_cycles = 0;
+    std::vector<uint32_t> stack;
+    for (size_t s = 0; s < nf; ++s) {
+        if (color[s] || qmesh.polygons[s].size() < 3) continue;
+        color[s] = 1;
+        stack.clear();
+        stack.push_back(static_cast<uint32_t>(s));
+        components.emplace_back();
+        auto& comp = components.back();
+        while (!stack.empty()) {
+            const uint32_t f = stack.back();
+            stack.pop_back();
+            comp.push_back(f);
+            for (const auto& [g, parity] : adj[f]) {
+                const int8_t want = static_cast<int8_t>(color[f] * parity);
+                if (color[g] == 0) {
+                    color[g] = want;
+                    stack.push_back(g);
+                } else if (color[g] != want) {
+                    odd_cycles++;          // genuine non-orientable junction: cannot be re-wound
+                }
+            }
+        }
+    }
+
+    size_t flipped = 0;
+    for (auto& comp : components) {
+        size_t neg = 0;
+        for (uint32_t f : comp) if (color[f] < 0) neg++;
+        const bool invert = neg * 2 > comp.size();     // flip the minority, keep the majority
+        for (uint32_t f : comp) {
+            const bool should_flip = invert ? (color[f] > 0) : (color[f] < 0);
+            if (!should_flip) continue;
+            std::reverse(qmesh.polygons[f].begin() + 1, qmesh.polygons[f].end());
+            flipped++;
+        }
+    }
+
+    // Recompute from the NEW traversals - the map above still holds the pre-flip directions, so
+    // reusing it would print "200->200" while the mesh is actually consistent (it did).
+    size_t conflicts_after = 0;
+    {
+        struct Chk { uint32_t f0 = INVALID_INDEX; int8_t d0 = 0; };
+        std::unordered_map<uint64_t, Chk> first;
+        std::unordered_set<uint64_t> skip;
+        first.reserve(nf * 2);
+        for (size_t fi = 0; fi < nf; ++fi) {
+            const auto& q = qmesh.polygons[fi];
+            const size_t pn = q.size();
+            if (pn < 3) continue;
+            for (size_t i = 0; i < pn; ++i) {
+                uint32_t a = q[i], b = q[(i + 1) % pn];
+                if (a == b || a >= qmesh.positions.size() || b >= qmesh.positions.size()) continue;
+                const uint64_t k = ekey(a, b);
+                const int8_t dir = (a < b) ? 1 : -1;
+                auto it = first.find(k);
+                if (it == first.end()) {
+                    Chk c; c.f0 = static_cast<uint32_t>(fi); c.d0 = dir;
+                    first.emplace(k, c);
+                } else if (!skip.count(k)) {
+                    if (it->second.f0 != static_cast<uint32_t>(fi)) {
+                        if (it->second.d0 == dir) conflicts_after++;
+                        skip.insert(k);          // 3rd+ face on this edge: not counted either way
+                    }
+                }
+            }
+        }
+    }
+    std::cout << "[stage6/rewind] conflicts " << conflicts_before << "->" << conflicts_after
+              << " faces_flipped=" << flipped << "/" << nf
+              << " components=" << components.size()
+              << " odd_cycles(unfixable)=" << odd_cycles << std::endl;
+}
+
 void Stage6Optimize::mirror_symmetry(
     RemeshContext& /*ctx*/,
     QuadMeshResult& qmesh,
@@ -2651,6 +2803,15 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
         qmesh.material_ids = std::move(keep_mats);
         std::cout << "[stage6/islands] kept=" << qmesh.polygons.size() << " dropped=" << dropped
                   << " thresh=" << thresh << " largest=" << largest << std::endl;
+    }
+
+    // T9: make the traversal consistent before anything measures a signed dihedral. Reverses
+    // polygon order only - no vertex moves, so SJ / Hausdorff / RMS / polygon count cannot change.
+    // Default OFF (QREMESH_REWIND=1) until the regression battery has been run through bench.py.
+    if (const char* e = std::getenv("QREMESH_REWIND")) {
+        if (std::atoi(e) != 0) {
+            rewind_inconsistent_faces(ctx, qmesh);
+        }
     }
 
     // T8 (BUG-01): topological repair of the degenerate sliver quads that fold over their
