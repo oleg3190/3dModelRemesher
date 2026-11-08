@@ -46,6 +46,13 @@ struct ExtractStats {
     size_t sum_quads = 0;
     size_t sum_nu = 0;
     size_t sum_nv = 0;
+    // T18/T5 metric: how much of the mesh sits on a grid too coarse to orthoganalize.
+    // A 2x2 (or 2x3) patch has at most one free interior node, so its quad shape is dictated by
+    // the 8 fixed border corners - the S26 ceiling. Large Delta-n cells make this worse, so the
+    // fraction of patches with min(nu,nv) < 3 is what T5 has to move, and the S47 median-SJ drop
+    // is the symptom it has to explain.
+    size_t patches_min_dim_lt3 = 0;
+    size_t patches_counted = 0;
     size_t mismatch_patches = 0;   // opposite sides with different sample counts
     size_t degenerate_slots = 0;   // border grid slots mapping to the same vertex
     size_t parity_hacks = 0;       // odd loop sample counts repaired by duplicating one
@@ -1174,6 +1181,8 @@ void Stage5ParamAndExtract::extract_patch_quads(
     int nv = static_cast<int>(D1);
     g_extract_stats.sum_nu += static_cast<size_t>(nu);
     g_extract_stats.sum_nv += static_cast<size_t>(nv);
+    g_extract_stats.patches_counted++;
+    if (std::min(nu, nv) < 3) g_extract_stats.patches_min_dim_lt3++;
     if (D0 != D2 || D1 != D3) g_extract_stats.mismatch_patches++;
 
     std::vector<std::vector<uint32_t>> grid(nu + 1, std::vector<uint32_t>(nv + 1, INVALID_INDEX));
@@ -2208,6 +2217,12 @@ QrmStatus Stage5ParamAndExtract::execute(
               << " avg_nu=" << (graph.patches.empty() ? 0.0 : static_cast<double>(g_extract_stats.sum_nu) / graph.patches.size())
               << " avg_nv=" << (graph.patches.empty() ? 0.0 : static_cast<double>(g_extract_stats.sum_nv) / graph.patches.size())
               << " mismatch_patches=" << g_extract_stats.mismatch_patches
+              << " coarse_min_dim_lt3=" << g_extract_stats.patches_min_dim_lt3
+              << "/" << g_extract_stats.patches_counted
+              << " (" << (g_extract_stats.patches_counted
+                  ? 100.0 * static_cast<double>(g_extract_stats.patches_min_dim_lt3)
+                        / static_cast<double>(g_extract_stats.patches_counted)
+                  : 0.0) << "%)"
               << " degenerate_slots=" << g_extract_stats.degenerate_slots
               << std::endl;
 
