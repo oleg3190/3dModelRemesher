@@ -1752,6 +1752,337 @@ void Stage5ParamAndExtract::untangle_patch_grids(
               << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// T17: paired probe - the seam-side counterpart of T16.
+//
+// Why: the [stage5/pleatmap] census splits pleats into INTRA (a patch folds over itself -
+// T16's monotone re-lay addresses those) and CROSS (the two faces live in DIFFERENT patches,
+// 431 of 787 on the AI model, S45/S46). T16 never moves a seam vertex (invariant #5), so the
+// cross half stays. Hypothesis under test: a seam pair whose BOTH patches measure >3% overlap
+// AND >3% gap still has slack, and rotating the free vertices of side A and side B around the
+// shared edge (a,b) by OPPOSITE angles - the symmetric "flag reflection" - unfolds the crease
+// while the seam loop itself never moves.
+//
+// Measure-first (invariant #16): runs only under QREMESH_T17 (default OFF), iterates records
+// strictly in vector order, greedy (an accepted move is visible to later records), no random.
+// Per candidate: rotate -> snap onto the source (invariant #7) -> travel cap 1.5*median edge;
+// the chosen candidate must then clear the pleat, create NO new inverted quad (sj5), and must
+// not raise the pleat count in the moved-faces 1-ring. Telemetry is printed even on rejects.
+// ---------------------------------------------------------------------------
+void Stage5ParamAndExtract::t17_paired_probe(
+    RemeshContext& ctx,
+    QuadMeshResult& out_quads,
+    const std::vector<uint32_t>& face_patch,
+    const std::vector<T17CrossPleat>& records,
+    const std::vector<float>& ov,
+    const std::vector<float>& gp
+) {
+    if (records.empty()) return;
+    const size_t nf = out_quads.polygons.size();
+    const size_t nv = out_quads.positions.size();
+    if (nf == 0 || nv == 0) return;
+
+    auto key2 = [](uint32_t a, uint32_t b) -> uint64_t {
+        return (static_cast<uint64_t>(std::min(a, b)) << 32) | static_cast<uint32_t>(std::max(a, b));
+    };
+    auto newell = [&](uint32_t fi) -> Vec3f {
+        const auto& p = out_quads.polygons[fi];
+        Vec3d n = Vec3d::Zero();
+        const size_t pn = p.size();
+        for (size_t i = 0; i < pn; ++i) {
+            Vec3d a = out_quads.positions[p[i]].cast<double>();
+            Vec3d b = out_quads.positions[p[(i + 1) % pn]].cast<double>();
+            n += a.cross(b);
+        }
+        const double ln = n.norm();
+        return ln > 1e-14 ? (n / ln).cast<float>() : Vec3f(0, 0, 0);
+    };
+    auto ang_deg = [](const Vec3f& n0, const Vec3f& n1) -> float {
+        return std::acos(std::max(-1.0f, std::min(1.0f, n0.dot(n1)))) * 180.0f / PI_F;
+    };
+    // The SAME winding-independent pleat test as the [stage5/pleatmap] census: two faces of
+    // the set sharing an edge, normal angle > 120 deg, free vertices on the SAME side of it.
+    auto count_pleats = [&](const std::vector<uint32_t>& faces) -> size_t {
+        struct ER { uint32_t f0, f1, w0, w1; };
+        std::unordered_map<uint64_t, ER> em;
+        for (uint32_t fi : faces) {
+            if (fi >= nf) continue;
+            const auto& q = out_quads.polygons[fi];
+            const size_t pn = q.size();
+            if (pn < 3) continue;
+            for (size_t i = 0; i < pn; ++i) {
+                uint32_t a = q[i], b = q[(i + 1) % pn];
+                if (a == b) continue;
+                uint32_t free_v = INVALID_INDEX;
+                for (size_t k = 0; k < pn; ++k)
+                    if (q[k] != a && q[k] != b) { free_v = q[k]; break; }
+                uint64_t k2 = key2(a, b);
+                auto it = em.find(k2);
+                if (it == em.end()) em.emplace(k2, ER{fi, INVALID_INDEX, free_v, INVALID_INDEX});
+                else if (it->second.f1 == INVALID_INDEX) { it->second.f1 = fi; it->second.w1 = free_v; }
+            }
+        }
+        std::unordered_map<uint32_t, Vec3f> fn;
+        for (uint32_t fi : faces) if (fi < nf) fn[fi] = newell(fi);
+        size_t folds = 0;
+        for (const auto& [k2, r] : em) {
+            if (r.f1 == INVALID_INDEX || r.w0 == INVALID_INDEX || r.w1 == INVALID_INDEX) continue;
+            const auto i0 = fn.find(r.f0), i1 = fn.find(r.f1);
+            if (i0 == fn.end() || i1 == fn.end()) continue;
+            if (ang_deg(i0->second, i1->second) <= 120.0f) continue;
+            const uint32_t a = static_cast<uint32_t>(k2 >> 32), b = static_cast<uint32_t>(k2 & 0xFFFFFFFFu);
+            Vec3f e = out_quads.positions[b] - out_quads.positions[a];
+            const float el = e.norm();
+            if (el < 1e-9f) continue;
+            e /= el;
+            const Vec3f mid = 0.5f * (out_quads.positions[a] + out_quads.positions[b]);
+            Vec3f u0 = out_quads.positions[r.w0] - mid, u1 = out_quads.positions[r.w1] - mid;
+            u0 -= u0.dot(e) * e;
+            u1 -= u1.dot(e) * e;
+            if (u0.dot(u1) > 0.0f) folds++;
+        }
+        return folds;
+    };
+
+    // vertex -> faces, edge -> faces (for the 1-ring scope) and the median edge length
+    // (travel-cap reference, same as in untangle_patch_grids)
+    std::vector<std::vector<uint32_t>> vfaces(nv);
+    std::unordered_map<uint64_t, std::vector<uint32_t>> efaces;
+    std::vector<float> all_len;
+    all_len.reserve(nf * 4);
+    for (size_t fi = 0; fi < nf; ++fi) {
+        const auto& q = out_quads.polygons[fi];
+        const size_t pn = q.size();
+        for (size_t i = 0; i < pn; ++i) {
+            const uint32_t a = q[i], b = q[(i + 1) % pn];
+            if (a < nv) vfaces[a].push_back(static_cast<uint32_t>(fi));
+            if (a < nv && b < nv && a != b) {
+                all_len.push_back((out_quads.positions[a] - out_quads.positions[b]).norm());
+                efaces[key2(a, b)].push_back(static_cast<uint32_t>(fi));
+            }
+        }
+    }
+    float med_e = 1.0f;
+    if (!all_len.empty()) {
+        std::nth_element(all_len.begin(), all_len.begin() + all_len.size() / 2, all_len.end());
+        med_e = all_len[all_len.size() / 2];
+    }
+
+    size_t trials = 0, og = 0, og_accepted = 0, nonog_accepted = 0;
+    size_t r_no_dof = 0, r_travel = 0, r_pleat_remains = 0, r_new_inv = 0, r_folds_up = 0, r_stale = 0;
+    size_t theta_reduced = 0, sj_scope_dropped = 0, moved_verts = 0;
+
+    std::vector<uint32_t> all_faces(nf);
+    for (size_t i = 0; i < nf; ++i) all_faces[i] = static_cast<uint32_t>(i);
+    const size_t pleats_before_total = count_pleats(all_faces);
+
+    auto has_og = [&](uint32_t p) -> bool {
+        return p < ov.size() && p < gp.size() && ov[p] > 0.03f && gp[p] > 0.03f;
+    };
+
+    for (const auto& rec : records) {
+        ++trials;
+        const bool is_og = has_og(rec.pa) && has_og(rec.pb);
+        if (is_og) ++og;
+        // defensive: records come from this very mesh and T16 changes no topology
+        if (rec.f0 >= nf || rec.f1 >= nf || rec.a >= nv || rec.b >= nv || rec.a == rec.b) continue;
+
+        const uint32_t a = rec.a, b = rec.b;
+        // side A = free vertices of f0 (not on the seam loop a,b) whose EVERY incident face
+        // belongs to pa; side B likewise with pb - the interior definition T16 uses. A vertex
+        // with a foreign incident face sits ON some border and must not be dragged along.
+        auto interior_to = [&](uint32_t v, uint32_t p) -> bool {
+            if (v >= vfaces.size() || vfaces[v].empty()) return false;
+            for (uint32_t fi : vfaces[v])
+                if (fi >= nf || fi >= face_patch.size() || face_patch[fi] != p) return false;
+            return true;
+        };
+        std::vector<uint32_t> setA, setB;
+        for (uint32_t v : out_quads.polygons[rec.f0]) {
+            if (v == a || v == b) continue;
+            if (std::find(setA.begin(), setA.end(), v) != setA.end()) continue;
+            if (interior_to(v, rec.pa)) setA.push_back(v);
+        }
+        for (uint32_t v : out_quads.polygons[rec.f1]) {
+            if (v == a || v == b) continue;
+            if (std::find(setB.begin(), setB.end(), v) != setB.end()) continue;
+            if (interior_to(v, rec.pb)) setB.push_back(v);
+        }
+        // degenerate pair sharing a 3rd vertex: side A wins, a vertex is rotated at most once
+        setB.erase(std::remove_if(setB.begin(), setB.end(),
+                                  [&](uint32_t v) {
+                                      return std::find(setA.begin(), setA.end(), v) != setA.end();
+                                  }),
+                   setB.end());
+        if (setA.empty() || setB.empty()) { ++r_no_dof; continue; }
+
+        const float dih = ang_deg(newell(rec.f0), newell(rec.f1));
+        if (dih <= 120.0f) { ++r_stale; continue; }   // already unfolded by an earlier move
+
+        const Vec3f pivot = out_quads.positions[a];
+        Vec3f axis = out_quads.positions[b] - pivot;
+        const float el = axis.norm();
+        if (el < 1e-9f) { ++r_stale; continue; }
+        axis /= el;
+        const Vec3f mid = 0.5f * (pivot + out_quads.positions[b]);
+        uint32_t w0 = INVALID_INDEX, w1 = INVALID_INDEX;
+        for (uint32_t v : out_quads.polygons[rec.f0]) if (v != a && v != b) { w0 = v; break; }
+        for (uint32_t v : out_quads.polygons[rec.f1]) if (v != a && v != b) { w1 = v; break; }
+        if (w0 == INVALID_INDEX || w1 == INVALID_INDEX) { ++r_no_dof; continue; }
+
+        // gamma targets: with BOTH sides turning by gamma the dihedral closes by 2*gamma, so
+        // these two values aim at 100 resp. 70 deg final angle (120 is the pleat threshold)
+        const float gammas[2] = {
+            std::max(0.0f, (dih - 100.0f) * 0.5f) * (PI_F / 180.0f),
+            std::max(0.0f, (dih - 70.0f) * 0.5f) * (PI_F / 180.0f)
+        };
+        const int signs[2] = { +1, -1 };   // +1: side A -gamma / side B +gamma, -1 mirrored
+
+        const std::vector<Vec3f> base_pos = out_quads.positions;   // greedy state at trial start
+        struct Cand {
+            bool cleans = false;
+            float th_after = 180.0f;
+            std::vector<uint32_t> mids;
+            std::vector<Vec3f> mpos;
+        };
+        Cand best;
+        bool have_best = false, any_valid = false;
+        float min_th_valid = 180.0f;
+        for (float gam : gammas) {
+            for (int s : signs) {
+                Cand c;
+                bool ok = true;
+                for (int side = 0; side < 2 && ok; ++side) {
+                    const std::vector<uint32_t>& ids = (side == 0) ? setA : setB;
+                    const float ang = (side == 0 ? -s : s) * gam;
+                    for (uint32_t v : ids) {
+                        const Vec3f orig = base_pos[v];
+                        const Vec3f d = orig - pivot;
+                        Vec3f r = d * std::cos(ang) + axis.cross(d) * std::sin(ang) +
+                                  axis * (axis.dot(d)) * (1.0f - std::cos(ang));
+                        Vec3f cand = pivot + r;
+                        // snap onto the source (invariant #7, as in untangle_patch_grids)
+                        Vec3f snap, nrm; float d2;
+                        if (ctx.original_bvh.closest_point(cand, snap, nrm, d2)) cand = snap;
+                        if ((cand - orig).norm() > 1.5f * med_e) { ok = false; break; }  // travel-reject
+                        c.mids.push_back(v);
+                        c.mpos.push_back(cand);
+                    }
+                }
+                if (!ok) continue;
+                // measure the candidate on the mesh, then restore the base state
+                for (size_t i = 0; i < c.mids.size(); ++i) out_quads.positions[c.mids[i]] = c.mpos[i];
+                c.th_after = ang_deg(newell(rec.f0), newell(rec.f1));
+                Vec3f u0 = out_quads.positions[w0] - mid, u1 = out_quads.positions[w1] - mid;
+                u0 -= u0.dot(axis) * axis;
+                u1 -= u1.dot(axis) * axis;
+                c.cleans = (c.th_after <= 120.0f) || (u0.dot(u1) <= 0.0f);
+                for (size_t i = 0; i < c.mids.size(); ++i) out_quads.positions[c.mids[i]] = base_pos[c.mids[i]];
+                any_valid = true;
+                min_th_valid = std::min(min_th_valid, c.th_after);
+                if (c.cleans && (!have_best || c.th_after < best.th_after)) {
+                    best = std::move(c);
+                    have_best = true;
+                }
+            }
+        }
+        if (!any_valid) { ++r_travel; continue; }
+        if (!have_best) {
+            // telemetry: how close the least-bad VALID candidate came to clearing the pleat
+            if (min_th_valid < dih - 1.0f) ++theta_reduced;
+            ++r_pleat_remains;
+            continue;
+        }
+        if (best.th_after < dih - 1.0f) ++theta_reduced;   // counted even if a gate rejects below
+
+        // scope: faces incident to moved vertices + the 1-ring over shared edges - the seam
+        // fold must be judged together with its neighbours (same reasoning as in T16)
+        std::vector<uint32_t> direct;
+        {
+            std::unordered_set<uint32_t> seen;
+            for (uint32_t v : best.mids)
+                for (uint32_t fi : vfaces[v])
+                    if (fi < nf && seen.insert(fi).second) direct.push_back(fi);
+        }
+        std::vector<uint32_t> scope = direct;
+        {
+            std::unordered_set<uint32_t> seen(direct.begin(), direct.end());
+            for (uint32_t fi : direct) {
+                const auto& q = out_quads.polygons[fi];
+                const size_t pn = q.size();
+                for (size_t i = 0; i < pn; ++i) {
+                    const uint32_t x = q[i], y = q[(i + 1) % pn];
+                    if (x == y) continue;
+                    auto it = efaces.find(key2(x, y));
+                    if (it == efaces.end()) continue;
+                    for (uint32_t g : it->second)
+                        if (g < nf && seen.insert(g).second) scope.push_back(g);
+                }
+            }
+        }
+
+        auto quad_sj = [&](uint32_t fi) -> float {
+            const auto& q = out_quads.polygons[fi];
+            return sj5(out_quads.positions[q[0]], out_quads.positions[q[1]],
+                       out_quads.positions[q[2]], out_quads.positions[q[3]]);
+        };
+        // BEFORE on the base state
+        std::unordered_map<uint32_t, float> sj_before;
+        float scope_sj_before = 1.0f;
+        for (uint32_t fi : direct)
+            if (out_quads.polygons[fi].size() == 4) sj_before[fi] = quad_sj(fi);
+        for (uint32_t fi : scope)
+            if (out_quads.polygons[fi].size() == 4) scope_sj_before = std::min(scope_sj_before, quad_sj(fi));
+        const size_t folds_before = count_pleats(scope);
+
+        for (size_t i = 0; i < best.mids.size(); ++i) out_quads.positions[best.mids[i]] = best.mpos[i];
+
+        // gate 1: a quad that was valid (sj >= 0) must not turn inverted (sj < 0)
+        bool new_inv = false;
+        for (const auto& [fi, sb] : sj_before) {
+            if (quad_sj(fi) < 0.0f && sb >= 0.0f) { new_inv = true; break; }
+        }
+        if (new_inv) {
+            for (size_t i = 0; i < best.mids.size(); ++i) out_quads.positions[best.mids[i]] = base_pos[best.mids[i]];
+            ++r_new_inv;
+            continue;
+        }
+        // telemetry: scope quality after the move - only reachable with NO new inverse
+        float scope_sj_after = 1.0f;
+        for (uint32_t fi : scope)
+            if (out_quads.polygons[fi].size() == 4) scope_sj_after = std::min(scope_sj_after, quad_sj(fi));
+        if (scope_sj_after < scope_sj_before - 1e-6f) ++sj_scope_dropped;
+
+        // gate 2: the move must not raise the pleat count inside the scope
+        if (count_pleats(scope) > folds_before) {
+            for (size_t i = 0; i < best.mids.size(); ++i) out_quads.positions[best.mids[i]] = base_pos[best.mids[i]];
+            ++r_folds_up;
+            continue;
+        }
+
+        // accepted: positions stay - greedy sequence, the next record sees this state
+        moved_verts += best.mids.size();
+        if (is_og) ++og_accepted; else ++nonog_accepted;
+    }
+
+    const size_t pleats_after_total = count_pleats(all_faces);
+    std::cout << "[stage5/t17/probe] pleats_total_before=" << pleats_before_total
+              << " after=" << pleats_after_total << std::endl;
+    std::cout << "[stage5/t17/probe] trials=" << trials
+              << " og=" << og
+              << " og_accepted=" << og_accepted
+              << " (" << (og ? 100.0 * static_cast<double>(og_accepted) /
+                               static_cast<double>(og) : 0.0) << "%)"
+              << " nonog_accepted=" << nonog_accepted
+              << " rej(no_dof=" << r_no_dof << " travel=" << r_travel
+              << " pleat_remains=" << r_pleat_remains << " new_inv=" << r_new_inv
+              << " folds_up=" << r_folds_up << " stale=" << r_stale << ")"
+              << " theta_reduced=" << theta_reduced
+              << " sj_scope_dropped=" << sj_scope_dropped
+              << " moved_verts=" << moved_verts
+              << std::endl;
+}
+
 QrmStatus Stage5ParamAndExtract::execute(
     RemeshContext& ctx,
     PatchGraph& graph,
@@ -1778,6 +2109,10 @@ QrmStatus Stage5ParamAndExtract::execute(
     // after the loop, so both the face->patch attribution and the candidate list live out here.
     std::vector<uint32_t> face_patch;
     std::vector<uint32_t> t16_candidates;
+    // T17 (paired seam probe): cross-pleat records and per-patch overlap/gap must survive the
+    // calibration passes for the same reason as face_patch - the last pass is the shipped mesh.
+    std::vector<float> t17_ov, t17_gp;
+    std::vector<T17CrossPleat> t17_cross;
 
     for (int calib = 0; calib < 3; ++calib) {
     balance_and_quantize_patch_sizes(ctx, graph, search_eff);
@@ -1969,6 +2304,7 @@ QrmStatus Stage5ParamAndExtract::execute(
     // the LAST occurrence is the shipped mesh. Kept unconditional because execute() has no
     // knowledge of which pass it is (the override flag lives in balance_and_quantize_patch_sizes).
     {
+        t17_cross.clear();   // rebuilt every calibration pass, like face_patch
         struct EdgeRec { uint32_t f0 = INVALID_INDEX, f1 = INVALID_INDEX;
                          uint32_t w0 = INVALID_INDEX, w1 = INVALID_INDEX; };
         std::unordered_map<uint64_t, EdgeRec> emap;
@@ -2035,7 +2371,13 @@ QrmStatus Stage5ParamAndExtract::execute(
             const uint32_t pa = (r.f0 < face_patch.size()) ? face_patch[r.f0] : INVALID_INDEX;
             const uint32_t pb = (r.f1 < face_patch.size()) ? face_patch[r.f1] : INVALID_INDEX;
             if (pa == pb) { pleat_intra++; if (pa != INVALID_INDEX) per_patch[pa]++; }
-            else pleat_cross++;
+            else {
+                pleat_cross++;
+                // T17: keep the seam pleats with a valid two-patch attribution - those are the
+                // ones a single-patch re-lay (T16) can never touch (it moves no seam vertex).
+                if (pa != INVALID_INDEX && pb != INVALID_INDEX)
+                    t17_cross.push_back(T17CrossPleat{r.f0, r.f1, a, b, pa, pb});
+            }
             folded_faces += 2;
         }
         size_t worst_n = 0; uint32_t worst_p = INVALID_INDEX; double sum_sq = 0.0;
@@ -2056,6 +2398,10 @@ QrmStatus Stage5ParamAndExtract::execute(
         // on the surface). Measured per patch, correlated with the pleat census above.
         size_t overlap_patches = 0, pleated_overlap = 0, pleated_clean = 0;
         t16_candidates.clear();
+        // T17: keep the measured per-patch overlap/gap for the paired probe. Patches with
+        // inside_cells < 8 are never rasterized and stay 0 (= no measured slack).
+        t17_ov.assign(graph.patches.size(), 0.0f);
+        t17_gp.assign(graph.patches.size(), 0.0f);
         double worst_ratio = 0.0; uint32_t worst_ratio_patch = INVALID_INDEX;
         std::vector<std::vector<uint32_t>> faces_of_patch(graph.patches.size());
         for (size_t fi = 0; fi < face_patch.size(); ++fi)
@@ -2186,6 +2532,8 @@ QrmStatus Stage5ParamAndExtract::execute(
             if (inside_cells >= 8) {
                 const double ov = static_cast<double>(n_double) / inside_cells;
                 const double gp = static_cast<double>(n_gap) / inside_cells;
+                t17_ov[p] = static_cast<float>(ov);
+                t17_gp[p] = static_cast<float>(gp);
                 if (ov > 0.03 && gp > 0.03) overlap_patches++;
                 const bool pleated0 = per_patch.count(static_cast<uint32_t>(p)) > 0;
                 if (pleated0) {
@@ -2203,6 +2551,36 @@ QrmStatus Stage5ParamAndExtract::execute(
                   << " pleated&clean=" << pleated_clean
                   << " worst_overlap_plus_gap=" << worst_ratio << " (patch " << worst_ratio_patch << ")"
                   << std::endl;
+
+        // T17 premise (invariant #16: measure first): of the seam pleats (pa != pb), how many
+        // sit on pairs where BOTH patches hold >3% double coverage AND >3% gap inside their own
+        // border - only those pairs have mesh slack for a monotone PAIRED re-lay (T16 showed
+        // that a single patch with both measures can re-lay; the seam side needs the pair).
+        {
+            std::unordered_map<uint64_t, bool> pair_og;
+            size_t pleats_in_og = 0, both_og_pairs = 0;
+            auto og_patch = [&](uint32_t p) -> bool {
+                return p < t17_ov.size() && t17_ov[p] > 0.03f && t17_gp[p] > 0.03f;
+            };
+            for (const auto& r : t17_cross) {
+                const uint64_t pk = (static_cast<uint64_t>(std::min(r.pa, r.pb)) << 32) |
+                                    static_cast<uint32_t>(std::max(r.pa, r.pb));
+                auto it = pair_og.find(pk);
+                if (it == pair_og.end()) {
+                    it = pair_og.emplace(pk, og_patch(r.pa) && og_patch(r.pb)).first;
+                    if (it->second) both_og_pairs++;
+                }
+                if (it->second) pleats_in_og++;
+            }
+            const size_t np = t17_cross.size();
+            std::cout << "[stage5/t17/census] cross_pleats=" << np
+                      << " pairs=" << pair_og.size()
+                      << " both_og_pairs=" << both_og_pairs
+                      << " pleats_in_both_og=" << pleats_in_og
+                      << " (" << (np ? 100.0 * static_cast<double>(pleats_in_og) /
+                                       static_cast<double>(np) : 0.0) << "%)"
+                      << std::endl;
+        }
     }
 
     polys_before_weld = static_cast<int64_t>(out_quads.polygons.size());
@@ -2273,6 +2651,14 @@ QrmStatus Stage5ParamAndExtract::execute(
         if (std::atoi(e) != 0) {
             untangle_patch_grids(ctx, out_quads, face_patch, t16_candidates);
         }
+    }
+
+    // T17 (BUG-01, seam side): paired probe - rotate the free vertices of BOTH patches around
+    // the shared edge of a cross-patch pleat, symmetric angles, seam loop untouched. Default
+    // OFF: QREMESH_T17 unset/0 skips the call and the mesh stays byte-identical.
+    if (const char* e = std::getenv("QREMESH_T17")) {
+        if (std::atoi(e) != 0)
+            t17_paired_probe(ctx, out_quads, face_patch, t17_cross, t17_ov, t17_gp);
     }
 
     weld_and_inherit_attributes(ctx, out_quads);
