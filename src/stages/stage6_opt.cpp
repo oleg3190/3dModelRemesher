@@ -395,8 +395,8 @@ void Stage6Optimize::fill_small_boundary_holes(
         std::vector<std::pair<uint64_t,uint64_t>> edge_cells; // (hash_a, hash_b) per unique edge
         std::unordered_map<uint64_t, size_t> edge_slot;        // combined key -> index in edge_cells
         auto cellhash = [&](const Vec3f& a) -> uint64_t { return okey(ocell(a)); };
-        for (const auto& t : ctx.original_bvh.triangles_ref()) {
-            uint64_t hs[3] = { cellhash(t.v0), cellhash(t.v1), cellhash(t.v2) };
+        auto add_tri = [&](const Vec3f& p0, const Vec3f& p1, const Vec3f& p2) {
+            uint64_t hs[3] = { cellhash(p0), cellhash(p1), cellhash(p2) };
             uint32_t vs[3][2] = {{0,1},{1,2},{2,0}};
             for (int k = 0; k < 3; ++k) {
                 uint64_t ha = hs[vs[k][0]], hb = hs[vs[k][1]];
@@ -411,6 +411,26 @@ void Stage6Optimize::fill_small_boundary_holes(
                     edge_count[comb]++;
                 }
             }
+        };
+        // S57: the guard's data source must be the RAW input. original_bvh is built AFTER
+        // stage0 nm-repair (keep-best-2 cut 1749 branches on the S57 model), so its
+        // single-face edges are REPAIR-INDUCED borders and the guard refused to close a
+        // real 39-vertex hole near them. QREMESH_HOLE_ORIGINPUT=1 -> raw-input silhouette;
+        // default OFF keeps the shipped behavior byte-identical.
+        bool raw_silhouette = false;
+        if (const char* e = std::getenv("QREMESH_HOLE_ORIGINPUT")) raw_silhouette = (std::atoi(e) != 0);
+        if (raw_silhouette && ctx.in_mesh) {
+            const QrmMeshIn* in = ctx.in_mesh;
+            auto P = [&](uint32_t vi) -> Vec3f {
+                return Vec3f(in->positions[3u * vi], in->positions[3u * vi + 1],
+                             in->positions[3u * vi + 2]);
+            };
+            for (uint32_t t = 0; t < in->nt; ++t) {
+                const uint32_t* ti = in->tri_indices + 3u * t;
+                add_tri(P(ti[0]), P(ti[1]), P(ti[2]));
+            }
+        } else {
+            for (const auto& t : ctx.original_bvh.triangles_ref()) add_tri(t.v0, t.v1, t.v2);
         }
         // insert the endpoint cells of every single-face (silhouette) edge
         for (const auto& sl : edge_slot) {
@@ -438,10 +458,102 @@ void Stage6Optimize::fill_small_boundary_holes(
         bnd_adj[v].push_back(u);
     }
 
-    std::unordered_set<uint32_t> visited_v;
     size_t holes_filled = 0;
     size_t border_preserved = 0;
+    size_t rejected_too_big = 0;
+    size_t rejected_non_simple = 0;
 
+    // S57 knobs (sew-the-seams on a watertight model): both default OFF => baseline
+    // byte-identical. QREMESH_HOLE_LIMIT overrides the hard-coded 30-vertex cap - a real
+    // hole LARGER than the cap was skipped silently (the S57 model has a 39-vertex loop).
+    // QREMESH_HOLE_PINCH switches to a directed boundary walk that rotates around degree-4
+    // vertices: the naive adjacency walk marks any loop touching a pinch as "non-simple"
+    // and drops it with no counter (S42 lesson: a silent rejection hides the defect) -
+    // that is why small loops stayed open on the S57 model.
+    size_t hole_limit = max_hole_verts;
+    if (const char* e = std::getenv("QREMESH_HOLE_LIMIT")) {
+        const int v = std::atoi(e);
+        if (v >= 4) hole_limit = static_cast<size_t>(v);
+    }
+    bool pinch_mode = false;
+    if (const char* e = std::getenv("QREMESH_HOLE_PINCH")) pinch_mode = (std::atoi(e) != 0);
+
+    // Fill ONE traced loop: legit-open-border guard, then a quad fan around a source-snapped
+    // centroid. Factored out of the naive walk so the directed (pinch) walker reuses it.
+    auto fill_loop = [&](const std::vector<uint32_t>& loop) {
+        if (loop.size() < 3 || loop.size() > hole_limit) return;
+        // Legit-open-border guard: skip unless the loop is a MICRO nick. Count how many
+        // vertices sit on the original silhouette.
+        {
+            size_t on_border = 0;
+            for (uint32_t lv : loop) if (vertex_on_open_border(lv)) on_border++;
+            // Real open border = a LONG chain whose every vertex lies on the original
+            // silhouette. Welding-jitter false positives are short and only partly
+            // on-border, so requiring ALL verts on border AND a minimum length keeps
+            // the guard protective (caps nothing on a genuine open edge) yet inert on
+            // watertight models (their few flagged edges are jitter, not silhouette).
+            const size_t MIN_BORDER_LOOP = 12;
+            if (on_border == loop.size() && loop.size() >= MIN_BORDER_LOOP) {
+                border_preserved++;
+                return;
+            }
+        }
+        // Compute average neighbor normal to ensure correct winding
+        Vec3f avg_normal = Vec3f::Zero();
+        for (uint32_t lv : loop) {
+            uint32_t nbr_v = bnd_adj[lv][0];
+            uint64_t k = (static_cast<uint64_t>(std::min(lv, nbr_v)) << 32) | std::max(lv, nbr_v);
+            auto it = edge_to_faces.find(k);
+            if (it != edge_to_faces.end()) {
+                for (uint32_t fi : it->second) {
+                    const auto& poly = qmesh.polygons[fi];
+                    if (poly.size() >= 3) {
+                        Vec3f fn = (qmesh.positions[poly[1]] - qmesh.positions[poly[0]]).cross(qmesh.positions[poly[2]] - qmesh.positions[poly[0]]);
+                        if (fn.norm() > 1e-6f) avg_normal += fn.normalized();
+                    }
+                }
+            }
+        }
+        if (avg_normal.norm() < 1e-6f) avg_normal = Vec3f(0.0f, 0.0f, 1.0f);
+        else avg_normal.normalize();
+
+        auto add_hole_face = [&](std::vector<uint32_t> f_verts) {
+            if (f_verts.size() < 3) return;
+            Vec3f fn = (qmesh.positions[f_verts[1]] - qmesh.positions[f_verts[0]]).cross(qmesh.positions[f_verts[2]] - qmesh.positions[f_verts[0]]);
+            if (fn.dot(avg_normal) < 0.0f) {
+                std::reverse(f_verts.begin(), f_verts.end());
+            }
+            qmesh.polygons.push_back(std::move(f_verts));
+            qmesh.material_ids.push_back(0);
+            holes_filled++;
+        };
+
+        if (loop.size() == 3) {
+            add_hole_face({loop[0], loop[1], loop[2]});
+        } else if (loop.size() == 4) {
+            add_hole_face({loop[0], loop[1], loop[2], loop[3]});
+        } else {
+            // Centroid fan
+            Vec3f c = Vec3f::Zero();
+            for (uint32_t lv : loop) c += qmesh.positions[lv];
+            c /= static_cast<float>(loop.size());
+            Vec3f cp, cn;
+            float d2;
+            if (ctx.original_bvh.closest_point(c, cp, cn, d2)) c = cp;
+            uint32_t c_idx = static_cast<uint32_t>(qmesh.positions.size());
+            qmesh.positions.push_back(c);
+            size_t L = loop.size();
+            for (size_t k = 0; k + 1 < L; k += 2) {
+                add_hole_face({loop[k], loop[k + 1], loop[(k + 2) % L], c_idx});
+            }
+            if (L % 2 == 1) {
+                add_hole_face({loop[L - 1], loop[0], c_idx});
+            }
+        }
+    };
+
+    std::unordered_set<uint32_t> visited_v;
+    if (!pinch_mode) {
     for (const auto& [start_v, nbrs] : bnd_adj) {
         if (visited_v.count(start_v) || nbrs.size() != 2) continue;
 
@@ -456,6 +568,7 @@ void Stage6Optimize::fill_small_boundary_holes(
             const auto& cur_nbrs = bnd_adj[curr];
             if (cur_nbrs.size() != 2) {
                 is_simple_loop = false;
+                rejected_non_simple++;
                 break;
             }
             uint32_t nxt = (cur_nbrs[0] == prev) ? cur_nbrs[1] : cur_nbrs[0];
@@ -464,89 +577,130 @@ void Stage6Optimize::fill_small_boundary_holes(
             }
             if (visited_v.count(nxt)) {
                 is_simple_loop = false;
+                rejected_non_simple++;
                 break;
             }
             prev = curr;
             curr = nxt;
-            if (loop.size() > max_hole_verts) {
+            if (loop.size() > hole_limit) {
                 is_simple_loop = false;
+                rejected_too_big++;
                 break;
             }
         }
 
-        if (is_simple_loop && loop.size() >= 3 && loop.size() <= max_hole_verts) {
-            // Legit-open-border guard: skip unless the loop is a MICRO nick. Count how many
-            // vertices sit on the original silhouette.
-            {
-                size_t on_border = 0;
-                for (uint32_t lv : loop) if (vertex_on_open_border(lv)) on_border++;
-                // Real open border = a LONG chain whose every vertex lies on the original
-                // silhouette. Welding-jitter false positives are short and only partly
-                // on-border, so requiring ALL verts on border AND a minimum length keeps
-                // the guard protective (caps nothing on a genuine open edge) yet inert on
-                // watertight models (their few flagged edges are jitter, not silhouette).
-                const size_t MIN_BORDER_LOOP = 12;
-                if (on_border == loop.size() && loop.size() >= MIN_BORDER_LOOP) {
-                    border_preserved++;
-                    continue;
-                }
-            }
-            // Compute average neighbor normal to ensure correct winding
-            Vec3f avg_normal = Vec3f::Zero();
-            for (uint32_t lv : loop) {
-                uint32_t nbr_v = bnd_adj[lv][0];
-                uint64_t k = (static_cast<uint64_t>(std::min(lv, nbr_v)) << 32) | std::max(lv, nbr_v);
-                auto it = edge_to_faces.find(k);
-                if (it != edge_to_faces.end()) {
-                    for (uint32_t fi : it->second) {
-                        const auto& poly = qmesh.polygons[fi];
-                        if (poly.size() >= 3) {
-                            Vec3f fn = (qmesh.positions[poly[1]] - qmesh.positions[poly[0]]).cross(qmesh.positions[poly[2]] - qmesh.positions[poly[0]]);
-                            if (fn.norm() > 1e-6f) avg_normal += fn.normalized();
-                        }
-                    }
-                }
-            }
-            if (avg_normal.norm() < 1e-6f) avg_normal = Vec3f(0.0f, 0.0f, 1.0f);
-            else avg_normal.normalize();
-
-            auto add_hole_face = [&](std::vector<uint32_t> f_verts) {
-                if (f_verts.size() < 3) return;
-                Vec3f fn = (qmesh.positions[f_verts[1]] - qmesh.positions[f_verts[0]]).cross(qmesh.positions[f_verts[2]] - qmesh.positions[f_verts[0]]);
-                if (fn.dot(avg_normal) < 0.0f) {
-                    std::reverse(f_verts.begin(), f_verts.end());
-                }
-                qmesh.polygons.push_back(std::move(f_verts));
-                qmesh.material_ids.push_back(0);
-                holes_filled++;
-            };
-
-            if (loop.size() == 3) {
-                add_hole_face({loop[0], loop[1], loop[2]});
-            } else if (loop.size() == 4) {
-                add_hole_face({loop[0], loop[1], loop[2], loop[3]});
-            } else {
-                // Centroid fan
-                Vec3f c = Vec3f::Zero();
-                for (uint32_t lv : loop) c += qmesh.positions[lv];
-                c /= static_cast<float>(loop.size());
-                Vec3f cp, cn;
-                float d2;
-                if (ctx.original_bvh.closest_point(c, cp, cn, d2)) c = cp;
-                uint32_t c_idx = static_cast<uint32_t>(qmesh.positions.size());
-                qmesh.positions.push_back(c);
-                size_t L = loop.size();
-                for (size_t k = 0; k + 1 < L; k += 2) {
-                    add_hole_face({loop[k], loop[k + 1], loop[(k + 2) % L], c_idx});
-                }
-                if (L % 2 == 1) {
-                    add_hole_face({loop[L - 1], loop[0], c_idx});
-                }
-            }
+        if (is_simple_loop && loop.size() >= 3 && loop.size() <= hole_limit) {
+            fill_loop(loop);
         }
     }
+    } // if (!pinch_mode)
+
+    if (pinch_mode) {
+        // Directed boundary walk: every boundary edge is oriented along its single face's
+        // winding, and next(a,b) rotates around b through the incident faces until a
+        // boundary edge leaves b. Two loops touching at a degree-4 vertex get separate
+        // walks here instead of being rejected as one non-simple blob by the naive walk.
+        struct DE { uint32_t a, b, f; };
+        auto pack = [](uint32_t a, uint32_t b) -> uint64_t {
+            return (static_cast<uint64_t>(a) << 32) | b;
+        };
+        std::vector<DE> des;
+        std::unordered_map<uint64_t, size_t> de_idx;
+        des.reserve(bnd_edges.size());
+        for (const auto& [u, v] : bnd_edges) {
+            const uint64_t ek = (static_cast<uint64_t>(std::min(u, v)) << 32) | std::max(u, v);
+            auto it = edge_to_faces.find(ek);
+            if (it == edge_to_faces.end() || it->second.size() != 1) continue;
+            const uint32_t f = it->second[0];
+            const auto& poly = qmesh.polygons[f];
+            const size_t n = poly.size();
+            uint32_t a = u, b = v;
+            bool wound = false;
+            for (size_t i = 0; i < n; ++i)
+                if (poly[i] == u && poly[(i + 1) % n] == v) { wound = true; break; }
+            if (!wound) { a = v; b = u; }
+            de_idx[pack(a, b)] = des.size();
+            des.push_back(DE{a, b, f});
+        }
+        auto succ = [&](uint32_t f, uint32_t x, uint32_t y) -> uint32_t {
+            const auto& poly = qmesh.polygons[f];
+            const size_t n = poly.size();
+            for (size_t i = 0; i < n; ++i)
+                if (poly[i] == x && poly[(i + 1) % n] == y) return poly[(i + 2) % n];
+            return INVALID_INDEX;
+        };
+        auto next_dir = [&](const DE& e, uint32_t& na, uint32_t& nb) -> bool {
+            uint32_t f = e.f;
+            uint32_t c = succ(f, e.a, e.b);
+            if (c == INVALID_INDEX) return false;
+            for (int step = 0; step < 32; ++step) {
+                const uint64_t ek = (static_cast<uint64_t>(std::min(e.b, c)) << 32) | std::max(e.b, c);
+                auto it = edge_to_faces.find(ek);
+                if (it != edge_to_faces.end() && it->second.size() == 1) {
+                    na = e.b; nb = c;   // f winds a->b->c, so the directed edge is b->c
+                    return true;
+                }
+                uint32_t g = INVALID_INDEX;
+                if (it != edge_to_faces.end())
+                    for (uint32_t x : it->second) if (x != f) { g = x; break; }
+                if (g == INVALID_INDEX) return false;
+                const uint32_t d = succ(g, c, e.b);   // g winds c->b->d
+                if (d == INVALID_INDEX) return false;
+                f = g;
+                c = d;
+            }
+            return false;
+        };
+        std::vector<uint8_t> used(des.size(), 0);
+        for (size_t i = 0; i < des.size(); ++i) {
+            if (used[i]) continue;
+            std::vector<uint32_t> loop;
+            bool ok = true;
+            size_t cur = i;
+            while (true) {
+                if (used[cur]) { ok = false; break; }
+                used[cur] = 1;
+                loop.push_back(des[cur].a);
+                uint32_t na = 0, nb = 0;
+                if (!next_dir(des[cur], na, nb)) { ok = false; break; }
+                auto nit = de_idx.find(pack(na, nb));
+                if (nit == de_idx.end()) { ok = false; break; }
+                if (nit->second == i) break;          // closed back to the start
+                cur = nit->second;
+            }
+            if (!ok) { rejected_non_simple++; continue; }
+            // A closed walk can pass a pinch vertex twice (figure-eight): split it into
+            // simple sub-loops before filling - a fan over a REPEATED vertex puts 4 faces
+            // on one radial edge (seen on the S57 model: nm=1 after the first pinch run).
+            std::vector<uint32_t> stack;
+            std::unordered_map<uint32_t, size_t> pos;
+            auto emit = [&](const std::vector<uint32_t>& sub) {
+                if (sub.size() < 3) return;
+                if (sub.size() > hole_limit) { rejected_too_big++; return; }
+                fill_loop(sub);
+            };
+            for (uint32_t v : loop) {
+                auto pit = pos.find(v);
+                if (pit != pos.end()) {
+                    std::vector<uint32_t> sub(stack.begin() + pit->second, stack.end());
+                    for (size_t k = pit->second + 1; k < stack.size(); ++k) pos.erase(stack[k]);
+                    stack.resize(pit->second + 1);   // back at v; v stays on the stack
+                    emit(sub);
+                } else {
+                    pos[v] = stack.size();
+                    stack.push_back(v);
+                }
+            }
+            emit(stack);
+        }
+    }
+
     std::cout << "[stage6] small boundary holes filled: " << holes_filled
-              << " border_loops_preserved: " << border_preserved << std::endl;
+              << " border_loops_preserved: " << border_preserved
+              << " rejected(too_big=" << rejected_too_big
+              << " non_simple=" << rejected_non_simple << ")"
+              << " limit=" << hole_limit
+              << " pinch=" << (pinch_mode ? 1 : 0) << std::endl;
 }
 
 void Stage6Optimize::tangential_taubin_smoothing(
