@@ -87,6 +87,8 @@ int main(int argc, char** argv) {
                   << "         --no-weld                  disable the preset weld relaxation\n"
                   << "         --drop-debris=on|off       dust removal\n"
                   << "         --single-shell / --drop-islands[=on|off]  final island drop\n"
+                  << "         --rewind=on|off / --no-rewind   face-orientation majority fix (DEFAULT on;\n"
+                  << "                                         geometry untouched, no-op on orientable input)\n"
                   << "Priority: explicit flag > --quality preset > QREMESH_* env > built-in default(off).\n"
                   << "--quality never changes the polygon target.\n";
         return 0;
@@ -98,7 +100,7 @@ int main(int argc, char** argv) {
     float density_override = -1.0f;
     // Start every repair field at -1 (auto): only explicit flags / a preset make them
     // authoritative; otherwise the library falls back to env then OFF (baseline preserved).
-    int8_t nm_keep_best = -1, drop_debris = -1, drop_islands = -1;
+    int8_t nm_keep_best = -1, drop_debris = -1, drop_islands = -1, rewind_faces = -1;
     float weld_scale = 0.0f;
 
     auto needs_val = [&](int i) -> bool { return i + 1 < argc; };
@@ -129,6 +131,8 @@ int main(int argc, char** argv) {
             drop_debris = (v == "off") ? 0 : 1;
         }
         else if (a == "--single-shell" || a == "--drop-islands") drop_islands = 1;
+        else if (a.rfind("--rewind=", 0) == 0) rewind_faces = (a.substr(9) == "off") ? 0 : 1;
+        else if (a == "--no-rewind") rewind_faces = 0;
         else if (a.rfind("--drop-islands=", 0) == 0) drop_islands = (a.substr(15) == "off") ? 0 : 1;
         else if (a.rfind("--dump=", 0) == 0) dump_dir = a.substr(7);
         else if (a.rfind("--density=", 0) == 0) density_override = std::atof(a.substr(10).c_str());
@@ -203,6 +207,7 @@ int main(int argc, char** argv) {
     params.nm_keep_best = nm_keep_best;
     params.drop_debris = drop_debris;
     params.drop_islands = drop_islands;
+    params.rewind_faces = rewind_faces;
     params.weld_scale = weld_scale;
     std::string dump_dir_local = dump_dir;
     if (!dump_dir_local.empty()) {

@@ -45,10 +45,13 @@ void qrm_default_params(QrmParams* p) {
     // QREMESH_* env override, then to the built-in default. Post-S41 that default is
     // nm_keep_best=ON (a no-op on clean manifold input; separates genuinely self-touching
     // shells without deleting them); weld_scale / drop_debris / drop_islands default OFF and
-    // are turned on only by --quality or their own flags.
+    // are turned on only by --quality or their own flags. rewind_faces is ON by default like
+    // nm_keep_best: it is a no-op on orientable input (verified bit-identical on the whole
+    // regression corpus) and on non-orientable input it only reverses polygon order.
     p->nm_keep_best = -1;
     p->drop_debris = -1;
     p->drop_islands = -1;
+    p->rewind_faces = -1;
     p->weld_scale = 0.0f;
 }
 

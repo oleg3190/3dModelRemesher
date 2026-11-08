@@ -40,6 +40,7 @@ RemeshContext::RemeshContext(
     repair.nm_keep_best = tri(params ? params->nm_keep_best : -1, "QREMESH_NM_KEEP_BEST", true);
     repair.drop_debris  = tri(params ? params->drop_debris  : -1, "QREMESH_DROP_DEBRIS", false);
     repair.drop_islands = tri(params ? params->drop_islands : -1, "QREMESH_DROP_ISLANDS", false);
+    repair.rewind     = tri(params ? params->rewind_faces : -1, "QREMESH_REWIND", true);
     if (params && params->weld_scale > 0.0f) {
         repair.weld_scale = params->weld_scale;        // CLI/preset wins
     } else if (const char* e = std::getenv("QREMESH_WELD_SCALE")) {
@@ -53,6 +54,7 @@ RemeshContext::RemeshContext(
               << " weld_scale=" << repair.weld_scale
               << " drop_debris=" << (repair.drop_debris ? "on" : "off")
               << " drop_islands=" << (repair.drop_islands ? "on" : "off")
+              << " rewind=" << (repair.rewind ? "on" : "off")
               << std::endl;
 }
 

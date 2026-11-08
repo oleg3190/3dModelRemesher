@@ -87,6 +87,9 @@ typedef struct QrmParams {
     int8_t nm_keep_best;             // non-manifold keep-best-2 repair (safe on clean input)
     int8_t drop_debris;              // drop disconnected dust components (aggressive)
     int8_t drop_islands;             // drop final island shells (single-shell policy)
+    int8_t rewind_faces;             // reverse face traversal where it disagrees with the
+                                     // orientation majority (S52; no vertex moves; DEFAULT ON,
+                                     // a no-op on orientable input)
     float  weld_scale;               // weld-tolerance multiplier; 0 = auto/none
 } QrmParams;
 

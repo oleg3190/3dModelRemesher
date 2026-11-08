@@ -39,6 +39,7 @@ public:
         bool  nm_keep_best = false;
         bool  drop_debris = false;
         bool  drop_islands = false;
+        bool  rewind = true;      // S52: re-wind inconsistent face traversal (geometry untouched)
         float weld_scale = 0.0f;   // 0 = none
     };
     Repair repair;
