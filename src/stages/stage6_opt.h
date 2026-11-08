@@ -42,6 +42,13 @@ private:
         QuadMeshResult& qmesh
     );
 
+    // T8: collapse degenerate short edges (sliver quads) that the untangler cannot fix.
+    static void collapse_degenerate_edges(
+        RemeshContext& ctx,
+        QuadMeshResult& qmesh,
+        float ratio
+    );
+
     static void mirror_symmetry(
         RemeshContext& ctx,
         QuadMeshResult& qmesh,

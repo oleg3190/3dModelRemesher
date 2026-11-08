@@ -64,6 +64,89 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
 
     int64_t target = ctx.params->target_quad_count;
     float h_initial = (ctx.params->target_edge_length > 0.0f) ? ctx.params->target_edge_length : ctx.base_target_length;
+
+    // ---- T8 side-balance guard (QREMESH_SIDE_BAL=ratio, default 0=OFF) ----------------
+    // Measured mechanism of the BUG-01 pleats: nu/nv of a patch grid come from the SUM of the
+    // loop divisions (i2=N/2, i1~N/4), so a patch whose opposite sides differ a lot (one=3025
+    // paths with d=1 against max=15) is filled with nu rows across a side that only holds 2
+    // border samples. The coarse end then has to span what the neighbour patch draws as many
+    // thin rows -> folded quads. Evidence: neighbour pairs with area ratio <0.25 pleat in 32%
+    // of cases versus a 5.1% base rate (test_out/pleat_count.py, control sphere 0.73%).
+    // The fix raises the SHORT side of an opposite pair. Raising happens on the CANONICAL PATH,
+    // which both neighbouring patches share, so seam consistency (invariant #5) holds by
+    // construction; paths with d=0 are never touched (that zero is the seam-matching rule,
+    // invariant #4). The budget estimator applies the SAME rule (invariant #10) - the first
+    // version only fixed the real pass and the polygon count ran away 9184 -> 16255.
+    int side_bal = 0;
+    if (const char* e = std::getenv("QREMESH_SIDE_BAL")) side_bal = std::atoi(e);
+    std::vector<std::vector<uint32_t>> loop_paths(num_patches);
+    if (side_bal > 1) {
+        for (size_t p = 0; p < num_patches; ++p) {
+            const auto& lp = graph.patches[p].boundary_loop;
+            loop_paths[p].reserve(lp.size());
+            for (const auto& eref : lp) {
+                if (eref.edge_path_id < num_edges) loop_paths[p].push_back(eref.edge_path_id);
+            }
+        }
+    }
+    auto apply_side_balance = [&](std::vector<int>& dv) -> size_t {
+        if (side_bal <= 1) return 0;
+        size_t raised_total = 0;
+        for (int round = 0; round < 6; ++round) {
+            bool changed = false;
+            for (size_t p = 0; p < num_patches; ++p) {
+                const auto& paths = loop_paths[p];
+                const size_t M = paths.size();
+                if (M < 4) continue;
+                int64_t N = 0;
+                for (uint32_t pi : paths) N += dv[pi];
+                if (N < 8) continue;             // nothing worth balancing on a minimal loop
+                // side boundaries = path cuts nearest to the loop quarter points (same rule as
+                // the corner snapping in evaluate_total_quads/extract_patch_quads)
+                auto cut_for = [&](int64_t targ, size_t lo, size_t hi) -> size_t {
+                    int64_t acc = 0; size_t bestk = lo; int64_t bestd = INT64_MAX;
+                    for (size_t k = 0; k < M; ++k) {
+                        if (k >= lo && k <= hi && k >= 1) {
+                            int64_t dd = std::abs(acc - targ);
+                            if (dd < bestd) { bestd = dd; bestk = k; }
+                        }
+                        acc += std::max(1, dv[paths[k]]);
+                    }
+                    return bestk;
+                };
+                size_t c1 = cut_for(N / 4, 1, M - 3);
+                size_t c2 = cut_for(N / 2, c1 + 1, M - 2);
+                size_t c3 = cut_for(3 * N / 4, c2 + 1, M - 1);
+                const size_t b[5] = { 0, c1, c2, c3, M };
+                int64_t s[4] = { 0, 0, 0, 0 };
+                for (int q = 0; q < 4; ++q)
+                    for (size_t k = b[q]; k < b[q + 1]; ++k) s[q] += dv[paths[k]];
+                for (int pair = 0; pair < 2; ++pair) {
+                    for (int dir = 0; dir < 2; ++dir) {
+                        int lo = pair * 2 + dir, hi = pair * 2 + (1 - dir);
+                        if (s[hi] <= 0) continue;
+                        int guard = 0;
+                        while (s[lo] * side_bal < s[hi] && guard++ < 400) {
+                            size_t bestk = b[lo];
+                            float bestl = -1.0f;
+                            for (size_t k = b[lo]; k < b[lo + 1]; ++k) {
+                                if (path_metric_len[paths[k]] > bestl) {
+                                    bestl = path_metric_len[paths[k]]; bestk = k;
+                                }
+                            }
+                            if (b[lo] >= b[lo + 1]) break;
+                            dv[paths[bestk]] += 1;
+                            s[lo] += 1;
+                            ++raised_total;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+        return raised_total;
+    };
     if (target <= 0) {
         for (size_t i = 0; i < num_edges; ++i) {
             graph.edge_paths[i].integer_divisions = std::clamp(static_cast<int>(std::round(path_metric_len[i] / h_initial)), 0, 100);
@@ -272,10 +355,20 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
 
     // 3. Binary search for optimal h matching target quad count
     std::vector<int> d_test(num_edges);
+    // Sliver guard floor (QREMESH_MIN_DIV). The BUDGET ESTIMATOR MUST MODEL IT (invariant #10):
+    // the first experiment applied the floor only after the search and the polygon count blew up
+    // 9184 -> 16255 (MIN_DIV=2) because h was calibrated against un-floored divisions.
+    int min_div = 0;
+    if (const char* e = std::getenv("QREMESH_MIN_DIV")) min_div = std::atoi(e);
+    auto floor_d = [min_div](int d) -> int {
+        return (min_div > 1 && d > 0 && d < min_div) ? min_div : d;
+    };
+
     auto evaluate_total_quads = [&](float h) -> int64_t {
         for (size_t e = 0; e < num_edges; ++e) {
-            d_test[e] = std::clamp(static_cast<int>(std::round(path_metric_len[e] / h)), 0, 100);
+            d_test[e] = floor_d(std::clamp(static_cast<int>(std::round(path_metric_len[e] / h)), 0, 100));
         }
+        apply_side_balance(d_test);   // the estimator must model the guard (invariant #10)
         int64_t total = 0;
         for (size_t p = 0; p < num_patches; ++p) {
             const auto& patch = graph.patches[p];
@@ -430,6 +523,16 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     // bit-deterministic) reach far lower residuals, usually zero. The greedy additionally
     // pays a small penalty for drifting away from the metric solution d0 so that the
     // density stays where the sizing field wants it (aspect ratio does not degrade).
+    // T8b: invariant #4 says a canonical path SHORTER than half a cell must carry NO intermediate
+    // sample (both patches then see the same zero, so the seam is identical by construction). The
+    // distributor rounds into clamp(..., 1, 100), i.e. every path gets at least one sample - the
+    // log proves it ([stage5/divs] zero=0 one=3025 on the AI model, zero=0 one=87 even on a clean
+    // icosphere). A path much shorter than a cell then contributes a border sample that is almost
+    // on top of its neighbour vertex -> spike quad (measured: 332 folded faces on the clean sphere,
+    // the worst of them 25x under the median face area). QREMESH_ALLOW_ZERO=1 restores the rule.
+    int d_floor = 1;
+    if (const char* e = std::getenv("QREMESH_ALLOW_ZERO")) d_floor = (std::atoi(e) != 0) ? 0 : 1;
+
     std::vector<int> d_int(num_edges);
     std::vector<int> r(num_rows, 0);
     int64_t E_res = 0;
@@ -453,7 +556,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     for (size_t e = 0; e < num_edges; ++e) {
         double base = kEnforceSideEqualities ? d_cont[e] : d0[e];
         double v = base + ((restart == 0) ? 0.0 : noise(rng));
-        d_int[e] = std::clamp(static_cast<int>(std::round(v)), 1, 100);
+        d_int[e] = std::clamp(static_cast<int>(std::round(v)), d_floor, 100);
     }
 
     r.assign(num_rows, 0);
@@ -475,7 +578,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
 
         for (size_t e = 0; e < num_edges; ++e) {
             for (int delta : {-1, 1}) {
-                if (d_int[e] + delta < 1 || d_int[e] + delta > 100) continue;
+                if (d_int[e] + delta < d_floor || d_int[e] + delta > 100) continue;
                 int64_t dE_res = 0;
                 for (const auto& entry : col_entries[e]) {
                     dE_res += 2 * delta * r[entry.row] * entry.coeff + entry.coeff * entry.coeff;
@@ -563,7 +666,7 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
                         if (std::abs(new_sum_delta) > 2) continue;
 
                         int max_d = std::max(3, static_cast<int>(std::round(d0[eid])) + 2);
-                        if (d_int[eid] + delta < 1 || d_int[eid] + delta > max_d) continue;
+                        if (d_int[eid] + delta < d_floor || d_int[eid] + delta > max_d) continue;
 
                         if (col_entries[eid].size() == 1) {
                             if (new_sum_delta <= 2) {
@@ -727,6 +830,35 @@ void Stage5ParamAndExtract::balance_and_quantize_patch_sizes(
     // (Sliver loops with < 4 paths are intentionally NOT special-cased here: bumping their
     //  divisions produced isolated islands - the patch across such a path does not carry
     //  that path in its own loop, so the extra samples cannot stitch anything together.)
+
+    // ---- Sliver guard (T8 experiment: QREMESH_MIN_DIV, default OFF) -----------------
+    // Measurement behind it: 3025 paths carry d=1 while the opposite side of the same patch
+    // sums to up to 15 ([stage5/divs] one=3025 max=15, [stage5/sides] ratio>2 on 432 patches),
+    // and the pleat rate at stage5 output is 10.3% of interior edges vs 0.7% on a clean control
+    // (test_out/pleat_count.py). A 1:15 strip is where the index-correspondence fill folds a
+    // quad back over its neighbour. Raising a whole PATH (a path is shared by exactly two
+    // patches, so both borders move together - invariant #5 holds; and this runs before the
+    // GF(2) parity fix, so parity is repaired afterwards) removes the thinnest rows.
+    // Paths with d=0 are left alone on purpose: that zero is the seam-matching mechanism
+    // (invariant #4), not a sliver.
+    {
+        std::vector<int> dv(num_edges);
+        for (size_t e = 0; e < num_edges; ++e) dv[e] = graph.edge_paths[e].integer_divisions;
+        size_t raised_floor = 0;
+        if (min_div > 1) {
+            for (size_t e = 0; e < num_edges; ++e) {
+                int fd = floor_d(dv[e]);
+                if (fd != dv[e]) { dv[e] = fd; ++raised_floor; }
+            }
+        }
+        const size_t raised_bal = apply_side_balance(dv);
+        if (raised_floor || raised_bal) {
+            for (size_t e = 0; e < num_edges; ++e) graph.edge_paths[e].integer_divisions = dv[e];
+            std::cout << "[stage5/sidebal] ratio=" << side_bal << " min_div=" << min_div
+                      << " floor_raised=" << raised_floor << " balance_raised=" << raised_bal
+                      << std::endl;
+        }
+    }
 
     // ---- Parity fix: every patch loop must hold an EVEN number of samples -----------
     // The sample-level 4-corner split (i2 = N/2, i3 = i1 + N/2) needs N even. Flipping

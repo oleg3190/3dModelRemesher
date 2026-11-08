@@ -7,6 +7,7 @@
 #include <numeric>
 #include <unordered_set>
 #include <unordered_map>
+#include <iterator>
 #include <iostream>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
@@ -1651,6 +1652,429 @@ void Stage6Optimize::localized_smooth_crease_repair(RemeshContext& ctx, QuadMesh
     }
 }
 
+// ---------------------------------------------------------------------------
+// T8: collapse degenerate short edges (sliver/spike quads).
+//
+// Why a TOPOLOGICAL op and not more smoothing: measured, the folded faces are degenerate by
+// SHAPE, not by placement. On a clean watertight icosphere (perfect source, 98.7% valence-4)
+// the extraction still folds 1.5% of its faces, and those faces are spikes: area 0.00001 against
+// a 0.00025 median (25x smaller), three of four corners within 0.004 of each other, SJ ~0.002.
+// On the AI model the BUG-01 zones carry 23% slivers (minEdge < 0.35 x median) against 12% for
+// the whole mesh and 15% "tiny area" against 6% - a 2x enrichment. No vertex move can repair a
+// quad whose two edges are ~zero long (that is exactly why the S42 unfold got blocked 527 times
+// by the SJ guard); the short edge has to go.
+//
+// Safety: only INTERIOR edges (exactly 2 faces) whose endpoints pass the link condition
+// (|N(u) n N(v)| == 2 - the standard manifold-preserving test), never a border or feature/sharp
+// vertex, chosen as a disjoint set ordered by length, merged position snapped onto the source
+// (invariant #7), and the WHOLE batch is reverted if the rebuilt mesh gains a boundary edge or
+// any edge ends up with >2 faces.
+// ---------------------------------------------------------------------------
+void Stage6Optimize::collapse_degenerate_edges(
+    RemeshContext& ctx,
+    QuadMeshResult& qmesh,
+    float ratio
+) {
+    const size_t nv = qmesh.positions.size();
+    const size_t nf = qmesh.polygons.size();
+    if (nv < 4 || nf < 2 || ratio <= 0.0f) return;
+
+    auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+        return (static_cast<uint64_t>(std::min(a, b)) << 32) | static_cast<uint32_t>(std::max(a, b));
+    };
+
+    struct EInfo { uint32_t f0 = INVALID_INDEX; uint32_t f1 = INVALID_INDEX; };
+    std::unordered_map<uint64_t, EInfo> edges;
+    std::unordered_set<uint64_t> over2;
+    edges.reserve(nf * 2);
+    std::vector<std::vector<uint32_t>> nbr(nv);
+    std::vector<uint8_t> is_border(nv, 0);
+
+    for (size_t fi = 0; fi < nf; ++fi) {
+        const auto& p = qmesh.polygons[fi];
+        const size_t pn = p.size();
+        if (pn < 3) continue;
+        for (size_t i = 0; i < pn; ++i) {
+            uint32_t a = p[i], b = p[(i + 1) % pn];
+            if (a >= nv || b >= nv || a == b) continue;
+            uint64_t k = ekey(a, b);
+            auto it = edges.find(k);
+            if (it == edges.end()) {
+                EInfo e; e.f0 = static_cast<uint32_t>(fi);
+                edges.emplace(k, e);
+            } else if (it->second.f1 == INVALID_INDEX && !over2.count(k)) {
+                if (it->second.f0 != static_cast<uint32_t>(fi)) it->second.f1 = static_cast<uint32_t>(fi);
+            } else {
+                over2.insert(k);
+            }
+            nbr[a].push_back(b);
+            nbr[b].push_back(a);
+        }
+    }
+    for (auto& [k, e] : edges) {
+        if (e.f1 == INVALID_INDEX && !over2.count(k)) {
+            is_border[static_cast<uint32_t>(k >> 32)] = 1;
+            is_border[static_cast<uint32_t>(k & 0xFFFFFFFFu)] = 1;
+        }
+    }
+    std::vector<uint8_t> is_sharp(nv, 0);
+    for (const auto& se : qmesh.sharp_edges) {
+        if (se.first < nv && se.second < nv) { is_sharp[se.first] = 1; is_sharp[se.second] = 1; }
+    }
+    for (size_t v = 0; v < nv; ++v) {
+        std::sort(nbr[v].begin(), nbr[v].end());
+        nbr[v].erase(std::unique(nbr[v].begin(), nbr[v].end()), nbr[v].end());
+    }
+
+    // median edge length (the scale the guard is expressed in)
+    std::vector<float> lens;
+    std::vector<uint64_t> keys;
+    lens.reserve(edges.size());
+    keys.reserve(edges.size());
+    for (const auto& [k, e] : edges) {
+        uint32_t a = static_cast<uint32_t>(k >> 32), b = static_cast<uint32_t>(k & 0xFFFFFFFFu);
+        lens.push_back((qmesh.positions[a] - qmesh.positions[b]).norm());
+        keys.push_back(k);
+    }
+    std::vector<float> lens_sorted = lens;
+    std::nth_element(lens_sorted.begin(), lens_sorted.begin() + lens_sorted.size() / 2, lens_sorted.end());
+    const float med = lens_sorted[lens_sorted.size() / 2];
+    if (!(med > 1e-9f)) return;
+    const float thresh = ratio * med;
+
+    size_t boundary_before = 0;
+    for (const auto& [k, e] : edges)
+        if (e.f1 == INVALID_INDEX && !over2.count(k)) boundary_before++;
+
+    // candidate interior short edges, deterministic order: shortest first, then by key
+    std::vector<std::pair<float, uint64_t>> cand;
+    size_t c_short = 0, c_border = 0, c_sharp = 0, c_link = 0;   // rejection breakdown
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const uint64_t k = keys[i];
+        if (lens[i] >= thresh || over2.count(k)) continue;
+        const EInfo& e = edges[k];
+        if (e.f0 == INVALID_INDEX || e.f1 == INVALID_INDEX) continue;
+        c_short++;
+        uint32_t u = static_cast<uint32_t>(k >> 32), v = static_cast<uint32_t>(k & 0xFFFFFFFFu);
+        if (u >= nv || v >= nv) continue;
+        if (is_border[u] || is_border[v]) { c_border++; continue; }
+        if (is_sharp[u] || is_sharp[v]) { c_sharp++; continue; }
+        // Manifoldness of the collapse: the one-ring of the edge must stay a disk. For a QUAD
+        // mesh the two faces adjacent to (u,v) contribute DIFFERENT opposite vertices, so a
+        // regular interior edge has |N(u) n N(v)| = 0 (or 1-2 when the ring is pinched); only
+        // MORE than 2 common neighbours signals a genuine non-manifold / shortcut collapse.
+        // (The first version required exactly 2 - the triangle-mesh rule - and it rejected every
+        // legal quad collapse: accepted=0 with 662 rej_link.) The batch validation below is the
+        // real safety net: any non-manifold edge or grown boundary reverts the whole batch.
+        std::vector<uint32_t> inter;
+        std::set_intersection(nbr[u].begin(), nbr[u].end(), nbr[v].begin(), nbr[v].end(),
+                              std::back_inserter(inter));
+        if (inter.size() > 2) { c_link++; continue; }
+        cand.emplace_back(lens[i], k);
+    }
+    std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first < b.first;
+        return a.second < b.second;
+    });
+
+    // ---- greedy, one collapse at a time, geometry validated BEFORE it is applied -------
+    // A batch version was tried first and rejected by measurement: at ratio 0.5 it removed 39 of
+    // the 127 BUG-01 targets and raised median SJ, but it also minted fully inverted quads
+    // (Min SJ -0.660 -> -0.9999) and one duplicate face reverted everything. Validating each
+    // candidate against its own affected ring keeps the pass monotone: it can only ever accept a
+    // collapse that does not worsen the worst quad it touches.
+    std::vector<std::vector<uint32_t>> polys = qmesh.polygons;
+    std::vector<uint8_t> alive(nf, 0);
+    std::vector<std::vector<uint32_t>> vfaces(nv);
+    std::unordered_map<uint64_t, uint32_t> ecount;
+    ecount.reserve(edges.size() * 2);
+    size_t boundary_live = 0;
+    for (size_t fi = 0; fi < nf; ++fi) {
+        const auto& p = polys[fi];
+        const size_t pn = p.size();
+        if (pn < 3) continue;
+        alive[fi] = 1;
+        for (uint32_t v : p) if (v < nv) vfaces[v].push_back(static_cast<uint32_t>(fi));
+        for (size_t i = 0; i < pn; ++i) {
+            uint32_t a = p[i], b = p[(i + 1) % pn];
+            if (a == b || a >= nv || b >= nv) continue;
+            uint64_t k2 = ekey(a, b);
+            uint32_t c = ++ecount[k2];
+            if (c == 1) boundary_live++;
+            else if (c == 2) boundary_live--;   // was a boundary edge, now interior
+        }
+    }
+
+    auto face_sj = [&](const std::vector<uint32_t>& p, const Vec3f* pos) -> float {
+        if (p.size() == 4) {
+            return compute_scaled_jacobian(pos[p[0]], pos[p[1]], pos[p[2]], pos[p[3]]);
+        }
+        return 1.0f;    // triangles/ngons carry no Scaled Jacobian in this pipeline
+    };
+    auto face_area = [&](const std::vector<uint32_t>& p, const Vec3f* pos) -> double {
+        if (p.size() < 3) return 0.0;
+        double a = 0.0;
+        for (size_t i = 1; i + 1 < p.size(); ++i) {
+            Vec3f e1 = pos[p[i]] - pos[p[0]];
+            Vec3f e2 = pos[p[i + 1]] - pos[p[0]];
+            a += 0.5 * static_cast<double>(e1.cross(e2).norm());
+        }
+        return a;
+    };
+    std::vector<Vec3f> positions = qmesh.positions;
+
+    size_t applied = 0, rej_topo = 0, rej_geom = 0, rej_dup = 0, killed_faces = 0;
+    size_t r_move = 0, r_sj = 0, r_area = 0, r_neg = 0;
+    std::vector<uint8_t> dead(nv, 0);
+
+    for (const auto& [len0, k] : cand) {
+        const uint32_t u = static_cast<uint32_t>(k >> 32);
+        const uint32_t v = static_cast<uint32_t>(k & 0xFFFFFFFFu);
+        if (u >= nv || v >= nv || dead[u] || dead[v]) continue;
+
+        std::vector<uint32_t> aff = vfaces[u];
+        aff.insert(aff.end(), vfaces[v].begin(), vfaces[v].end());
+        std::sort(aff.begin(), aff.end());
+        aff.erase(std::unique(aff.begin(), aff.end()), aff.end());
+        if (aff.empty()) continue;
+
+        // merged position: midpoint, snapped onto the source, allowed to travel <= 0.5 median edge
+        Vec3f mid = 0.5f * (positions[u] + positions[v]);
+        Vec3f snap, nrm;
+        float d2;
+        if (ctx.original_bvh.closest_point(mid, snap, nrm, d2) &&
+            (snap - mid).norm() < 0.5f * med) mid = snap;
+        if ((mid - positions[u]).norm() > 0.5f * med ||
+            (mid - positions[v]).norm() > 0.5f * med) { r_move++; rej_geom++; continue; }
+
+        // simulate: rewrite the affected ring with v -> u
+        struct Chg { uint32_t fi; std::vector<uint32_t> np; };
+        std::vector<Chg> chgs;
+        chgs.reserve(aff.size());
+        std::unordered_map<uint64_t, int> delta;
+        bool dup_bad = false;
+        std::vector<Vec3f> tmp = positions;   // only tmp[u] differs below
+        tmp[u] = mid;
+        float sj_before = 1.0f, sj_after = 1.0f;
+        double area_before = 0.0, area_after = 0.0;
+        for (uint32_t fi : aff) {
+            if (!alive[fi]) continue;
+            const auto& old = polys[fi];
+            sj_before = std::min(sj_before, face_sj(old, positions.data()));
+            area_before += face_area(old, positions.data());
+
+            std::vector<uint32_t> np;
+            np.reserve(old.size());
+            for (uint32_t x : old) {
+                uint32_t y = (x == v) ? u : x;
+                if (np.empty() || np.back() != y) np.push_back(y);
+            }
+            while (np.size() > 1 && np.front() == np.back()) np.pop_back();
+            if (np.size() >= 3) {
+                std::vector<uint32_t> srt = np;
+                std::sort(srt.begin(), srt.end());
+                if (std::adjacent_find(srt.begin(), srt.end()) != srt.end()) dup_bad = true;
+            }
+            const size_t pn = old.size();
+            for (size_t i = 0; i < pn; ++i) {
+                uint32_t a = old[i], b = old[(i + 1) % pn];
+                if (a == b) continue;
+                delta[ekey(a, b)] -= 1;
+            }
+            const size_t qn = np.size();
+            for (size_t i = 0; i < qn; ++i) {
+                uint32_t a = np[i], b = np[(i + 1) % qn];
+                if (a == b) continue;
+                delta[ekey(a, b)] += 1;
+            }
+            // Metrics MUST be computed before np is moved out (the first version read np after
+            // std::move: area_after/sj_after were evaluated on an emptied vector, which rejected
+            // 594/662 candidates in the area band and let the survivors mint inverted quads).
+            if (qn >= 3) {
+                sj_after = std::min(sj_after, face_sj(np, tmp.data()));
+                area_after += face_area(np, tmp.data());
+            }
+            chgs.push_back(Chg{fi, std::move(np)});
+        }
+        if (dup_bad) { rej_dup++; continue; }
+
+        // topology: no edge may end up with >2 faces, the boundary may not grow
+        bool topo_ok = true;
+        long boundary_after = static_cast<long>(boundary_live);
+        for (const auto& [e, d] : delta) {
+            if (d == 0) continue;
+            long before = static_cast<long>(ecount.count(e) ? ecount[e] : 0u);
+            long after = before + d;
+            if (after > 2 || after < 0) { topo_ok = false; break; }
+            if (before == 1 && after != 1) boundary_after--;   // boundary edge became interior
+            if (before == 0 && after == 1) boundary_after++;   // new boundary edge
+        }
+        if (!topo_ok) { rej_topo++; continue; }
+        if (boundary_after > static_cast<long>(boundary_live)) { rej_topo++; continue; }
+
+        // geometry: the collapse must not worsen the worst quad it touches
+        {
+            size_t neg_before = 0, neg_after = 0;
+            for (uint32_t fi : aff) {
+                if (!alive[fi]) continue;
+                if (face_sj(polys[fi], positions.data()) < 0.0f) neg_before++;
+            }
+            for (const auto& c : chgs) if (c.np.size() >= 3 && face_sj(c.np, tmp.data()) < 0.0f) neg_after++;
+            if (neg_after > neg_before) { r_neg++; rej_geom++; continue; }
+        }
+        if (sj_after < sj_before - 0.02f) { r_sj++; rej_geom++; continue; }
+        // Area is NOT the guard here: collapsing a folded flap legitimately removes the area it
+        // double-covered (the first version kept a [0.55,1.45] band and it rejected 594/662
+        // candidates precisely because the repair works). The real safety net is: no new negative
+        // quad, no grown boundary, no non-manifold edge, plus the RMS/Hausdorff/boundary metrics
+        // measured outside. Only INFLATION (wrinkles, invariant #7) stays bounded.
+        // Area: only INFLATION is bounded (wrinkles, invariant #7). Shrinking is the point of the
+        // operation - a folded flap contributes area the surface does not have. The shrink side is
+        // watched from outside by RMS/Hausdorff/boundary.
+        if (area_before > 1e-12 && area_after > 1.45 * area_before) {
+            r_area++;
+            rej_geom++;
+            continue;
+        }
+
+        // commit
+        for (const auto& c : chgs) {
+            const auto& old = polys[c.fi];
+            const size_t pn = old.size();
+            for (size_t i = 0; i < pn; ++i) {
+                uint32_t a = old[i], b = old[(i + 1) % pn];
+                if (a == b) continue;
+                uint64_t e = ekey(a, b);
+                auto it = ecount.find(e);
+                if (it != ecount.end()) {
+                    if (it->second > 1) it->second -= 1;
+                    else { if (it->second == 1) boundary_live--; ecount.erase(it); }
+                }
+            }
+            const size_t qn = c.np.size();
+            for (size_t i = 0; i < qn; ++i) {
+                uint32_t a = c.np[i], b = c.np[(i + 1) % qn];
+                if (a == b) continue;
+                uint64_t e = ekey(a, b);
+                uint32_t before = ecount.count(e) ? ecount[e] : 0u;
+                uint32_t& cref = ecount[e];
+                cref = before + 1;
+                if (before == 0) boundary_live++;
+                else if (before == 1) boundary_live--;
+            }
+            if (c.np.size() < 3) { alive[c.fi] = 0; polys[c.fi].clear(); killed_faces++; }
+            else polys[c.fi] = std::move(c.np);
+        }
+        if (std::getenv("QREMESH_COLLAPSE_TRACE") != nullptr) {
+            // find the ring quad that ended up terrible, if any (guard-hole detector)
+            for (const auto& c : chgs) {
+                if (c.np.size() != 4) continue;
+                float f = compute_scaled_jacobian(tmp[c.np[0]], tmp[c.np[1]], tmp[c.np[2]], tmp[c.np[3]]);
+                if (f < -0.7f) {
+                    std::cout << "  [collapse trace] face " << c.fi << " after collapse (" << u << "," << v
+                              << ") sj=" << f << " corners(" << c.np[0] << "," << c.np[1] << ","
+                              << c.np[2] << "," << c.np[3] << ") sj_before_ring=" << sj_before
+                              << " sj_after_ring=" << sj_after << std::endl;
+                }
+            }
+        }
+        positions[u] = mid;
+        dead[v] = 1;
+        for (uint32_t fi : vfaces[v]) {
+            if (std::find(vfaces[u].begin(), vfaces[u].end(), fi) == vfaces[u].end())
+                vfaces[u].push_back(fi);
+        }
+        vfaces[v].clear();
+        applied++;
+    }
+
+    std::cout << "[stage6/collapse/scan] short=" << c_short << " rej_border=" << c_border
+              << " rej_sharp=" << c_sharp << " rej_link=" << c_link
+              << " accepted=" << cand.size() << " (sharp_verts="
+              << (size_t)std::count(is_sharp.begin(), is_sharp.end(), 1)
+              << " border_verts=" << (size_t)std::count(is_border.begin(), is_border.end(), 1)
+              << " sharp_edges=" << qmesh.sharp_edges.size() << ")" << std::endl;
+    // Global sanity of the guards themselves: if the mesh-wide worst quad got worse while every
+    // per-collapse check passed, the checks have a hole - so measure it instead of trusting it.
+    float sj_min_before = 1.0f, sj_min_after = 1.0f;
+    for (size_t fi = 0; fi < nf; ++fi) {
+        const auto& p0 = qmesh.polygons[fi];
+        if (p0.size() == 4) {
+            sj_min_before = std::min(sj_min_before, compute_scaled_jacobian(
+                qmesh.positions[p0[0]], qmesh.positions[p0[1]],
+                qmesh.positions[p0[2]], qmesh.positions[p0[3]]));
+        }
+    }
+    for (const auto& p0 : polys) {
+        if (p0.size() == 4) {
+            sj_min_after = std::min(sj_min_after, compute_scaled_jacobian(
+                positions[p0[0]], positions[p0[1]], positions[p0[2]], positions[p0[3]]));
+        }
+    }
+
+    std::cout << "[stage6/collapse/qc] applied=" << applied << " rej_topo=" << rej_topo
+              << " move=" << r_move << " sj_worst=" << r_sj << " area=" << r_area
+              << " new_negative=" << r_neg << " rej_dup=" << rej_dup
+              << " mesh_min_sj " << sj_min_before << "->" << sj_min_after << std::endl;
+
+    if (applied == 0) {
+        std::cout << "[stage6/collapse] thresh=" << thresh << " (" << ratio << " x median " << med
+                  << ") candidates=" << cand.size() << " applied=0"
+                  << " rej_topo=" << rej_topo << " rej_geom=" << rej_geom
+                  << " rej_dup=" << rej_dup << std::endl;
+        return;
+    }
+
+    // compact: rebuild the polygon list and the vertex table without dead vertices/faces
+    std::vector<uint32_t> compact(nv, INVALID_INDEX);
+    std::vector<Vec3f> new_pos;
+    new_pos.reserve(nv);
+    std::vector<std::vector<uint32_t>> new_polys;
+    std::vector<uint16_t> new_mats;
+    new_polys.reserve(nf);
+    new_mats.reserve(nf);
+    for (size_t fi = 0; fi < nf; ++fi) {
+        if (!alive[fi]) continue;
+        std::vector<uint32_t> p;
+        p.reserve(polys[fi].size());
+        bool ok = true;
+        for (uint32_t v : polys[fi]) {
+            if (v >= nv || dead[v]) { ok = false; break; }
+            if (compact[v] == INVALID_INDEX) {
+                compact[v] = static_cast<uint32_t>(new_pos.size());
+                new_pos.push_back(positions[v]);
+            }
+            uint32_t c = compact[v];
+            if (p.empty() || p.back() != c) p.push_back(c);
+        }
+        while (p.size() > 1 && p.front() == p.back()) p.pop_back();
+        if (!ok || p.size() < 3) continue;
+        new_polys.push_back(std::move(p));
+        new_mats.push_back(fi < qmesh.material_ids.size() ? qmesh.material_ids[fi] : 0);
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> new_sharp;
+    for (const auto& se : qmesh.sharp_edges) {
+        if (se.first < nv && se.second < nv && !dead[se.first] && !dead[se.second]) {
+            uint32_t a = compact[se.first], b = compact[se.second];
+            if (a != INVALID_INDEX && b != INVALID_INDEX && a != b) new_sharp.emplace_back(a, b);
+        }
+    }
+
+    qmesh.positions = std::move(new_pos);
+    qmesh.polygons = std::move(new_polys);
+    qmesh.material_ids = std::move(new_mats);
+    qmesh.sharp_edges = std::move(new_sharp);
+
+    std::cout << "[stage6/collapse] thresh=" << thresh << " (" << ratio << " x median " << med
+              << ") candidates=" << cand.size() << " applied=" << applied
+              << " rej_topo=" << rej_topo << " rej_geom=" << rej_geom
+              << "(move=" << r_move << " sj=" << r_sj << " area=" << r_area
+              << " neg=" << r_neg << ") rej_dup=" << rej_dup
+              << " faces " << nf << "->" << qmesh.polygons.size() << " killed=" << killed_faces
+              << " verts " << nv << "->" << qmesh.positions.size() << std::endl;
+}
+
 void Stage6Optimize::mirror_symmetry(
     RemeshContext& /*ctx*/,
     QuadMeshResult& qmesh,
@@ -2227,6 +2651,19 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
         qmesh.material_ids = std::move(keep_mats);
         std::cout << "[stage6/islands] kept=" << qmesh.polygons.size() << " dropped=" << dropped
                   << " thresh=" << thresh << " largest=" << largest << std::endl;
+    }
+
+    // T8 (BUG-01): topological repair of the degenerate sliver quads that fold over their
+    // neighbour. Runs before the T7 mask so T7 sees the repaired topology. Default OFF
+    // (QREMESH_COLLAPSE=<ratio>, e.g. 0.35) - the baseline stays bit-identical without it.
+    float collapse_ratio = 0.0f;
+    if (const char* e = std::getenv("QREMESH_COLLAPSE")) {
+        float v = std::atof(e);
+        if (v > 0.0f) collapse_ratio = v;
+    }
+    if (collapse_ratio > 0.0f) {
+        collapse_degenerate_edges(ctx, qmesh, collapse_ratio);
+        log_area("after_collapse");
     }
 
     // T7 (BUG-01): localized smooth-crease repair. Runs LAST on geometry (after the final
