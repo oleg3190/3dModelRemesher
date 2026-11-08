@@ -132,15 +132,84 @@ QrmStatus Stage2SizingField::execute(RemeshContext& ctx) {
     float alpha = clampf(ctx.params->adaptive_density, 0.0f, 1.0f);
     ctx.sizing_field.resize(ctx.working_mesh.vertices.size());
 
+    // ---- Delta-n sizing law (T13, experiment: QREMESH_DN_DEG=<deg>, default 0 = OFF) ----------
+    // S44/S46 measurements behind it: (a) the folds are a curvature-versus-cell-size phenomenon -
+    // a clean icosphere (no noise at all) still folds 0.73% of its edges while a flat rail folds
+    // 0.00%; (b) the CURRENT adaptive law makes it worse, monotonically (density 0/0.5/1.0 ->
+    // pleat 4.65/5.09/5.79%), because its control signal max(|k1|,|k2|) is NOISE on an AI mesh;
+    // (c) a structure probe (test_out/structure_probe.py) shows 52% of this model's area sits in
+    // planar regions that could carry a MUCH larger cell, i.e. polygon budget is being spent
+    // where the surface is flat. So bound the cell by the normal deviation it may introduce:
+    //   h <= 2 * r_curv * sin(dn/2),  r_curv = 1 / kappa_denoised
+    // which shrinks cells on curvature and lets them grow on flat zones (the current law can only
+    // shrink). kappa is denoised by ring averaging - that is the part that matters most.
+    float dn_deg = 0.0f;
+    if (const char* e = std::getenv("QREMESH_DN_DEG")) dn_deg = std::atof(e);
+    std::vector<float> kappa_raw(ctx.working_mesh.vertices.size(), 0.0f);
+    std::vector<float> kappa_denoise;
+    if (dn_deg > 0.0f) {
+        for (size_t i = 0; i < kappa_raw.size(); ++i)
+            kappa_raw[i] = std::max(std::abs(curvatures[i].k1), std::abs(curvatures[i].k2));
+        kappa_denoise = kappa_raw;
+        for (int pass = 0; pass < 2; ++pass) {          // 2 ring passes, deterministic order
+            std::vector<float> next = kappa_denoise;
+            for (size_t v = 0; v < ctx.working_mesh.vertices.size(); ++v) {
+                if (ctx.working_mesh.vertices[v].is_deleted) continue;
+                auto nb = ctx.working_mesh.get_vertex_neighbors(static_cast<uint32_t>(v));
+                if (nb.empty()) continue;
+                double s = kappa_denoise[v];
+                size_t c = 1;
+                for (uint32_t u : nb) {
+                    if (u >= kappa_denoise.size() || ctx.working_mesh.vertices[u].is_deleted) continue;
+                    s += kappa_denoise[u]; ++c;
+                }
+                next[v] = static_cast<float>(s / static_cast<double>(c));
+            }
+            kappa_denoise.swap(next);
+        }
+    }
+    const float dn_half_rad = 0.5f * dn_deg * PI_F / 180.0f;
+    float min_scale = 0.25f, max_scale = 3.0f;
+    if (const char* e = std::getenv("QREMESH_DN_MIN")) min_scale = std::atof(e);
+    if (const char* e = std::getenv("QREMESH_DN_MAX")) max_scale = std::atof(e);
+
     for (size_t i = 0; i < ctx.working_mesh.vertices.size(); ++i) {
         if (ctx.working_mesh.vertices[i].is_deleted) continue;
-        float max_k = std::max(std::abs(curvatures[i].k1), std::abs(curvatures[i].k2));
-        float curv_factor = 1.0f / (1.0f + alpha * clampf(max_k / kappa_ref, 0.0f, 1.0f));
-
         float user_w = ctx.working_mesh.vertices[i].density_weight;
         float weight_factor = 1.0f / std::sqrt(std::max(user_w, 0.25f));
 
-        ctx.sizing_field[i] = ctx.base_target_length * curv_factor * weight_factor;
+        if (dn_deg > 0.0f) {
+            const float k = kappa_denoise[i];
+            const float h_dn = (k > 1e-4f)
+                ? 2.0f * std::sin(dn_half_rad) / k
+                : std::numeric_limits<float>::infinity();   // flat: as large as the cap allows
+            const float lo = min_scale * ctx.base_target_length;
+            const float hi = max_scale * ctx.base_target_length;
+            float h = clampf(h_dn, lo, hi);
+            ctx.sizing_field[i] = h * weight_factor;
+        } else {
+            float max_k = std::max(std::abs(curvatures[i].k1), std::abs(curvatures[i].k2));
+            float curv_factor = 1.0f / (1.0f + alpha * clampf(max_k / kappa_ref, 0.0f, 1.0f));
+            ctx.sizing_field[i] = ctx.base_target_length * curv_factor * weight_factor;
+        }
+    }
+
+    if (dn_deg > 0.0f) {
+        std::vector<float> sfield;
+        for (size_t i = 0; i < ctx.sizing_field.size(); ++i)
+            if (!ctx.working_mesh.vertices[i].is_deleted) sfield.push_back(ctx.sizing_field[i]);
+        std::nth_element(sfield.begin(), sfield.begin() + sfield.size() / 2, sfield.end());
+        std::cout << "[stage2/dn] deg=" << dn_deg << " min=" << min_scale << " max=" << max_scale
+                  << " sizing/base median=" << (sfield.empty() ? 0.0f : sfield[sfield.size() / 2] / ctx.base_target_length)
+                  << " denoised_kappa_median="
+                  << [&]() {
+                         std::vector<float> kk;
+                         for (size_t i = 0; i < kappa_denoise.size(); ++i)
+                             if (!ctx.working_mesh.vertices[i].is_deleted) kk.push_back(kappa_denoise[i]);
+                         std::nth_element(kk.begin(), kk.begin() + kk.size() / 2, kk.end());
+                         return kk.empty() ? 0.0f : kk[kk.size() / 2];
+                     }()
+                  << std::endl;
     }
 
     // Calibrate sizing field against target_quad_count if exact budget requested
