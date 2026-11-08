@@ -32,6 +32,85 @@ float sj5(const Vec3f& p0, const Vec3f& p1, const Vec3f& p2, const Vec3f& p3) {
     }
     return min_j;
 }
+
+// T15: pleat census with a switchable definition on ONE mesh, so the S45 claim "546..787 right
+// after extraction vs 1855 in stage5_extracted.obj" decomposes into (definition gap) x (filter
+// effect) instead of comparing two different metrics (S46 lesson: verify the DEFINITION on both
+// sides of a comparison). gated = the [stage5/pleatmap] census: Newell-normal angle > 120 deg AND
+// same side. sameside = test_out/pleat_count.py: same side only, no angle gate (folds from ~90
+// deg up). Pairing matches the census: first two incident faces in insertion order, first free
+// vertex = first polygon vertex that is not an edge endpoint; zero-length edges skipped by both.
+struct PleatCounts { size_t gated = 0; size_t sameside = 0; };
+
+PleatCounts count_pleats_t15(const std::vector<Vec3f>& POS,
+                             const std::vector<std::vector<uint32_t>>& polys) {
+    PleatCounts out;
+    struct ER { uint32_t f0 = INVALID_INDEX, f1 = INVALID_INDEX;
+                uint32_t w0 = INVALID_INDEX, w1 = INVALID_INDEX; };
+    std::unordered_map<uint64_t, ER> emap;
+    auto key2 = [](uint32_t a, uint32_t b) -> uint64_t {
+        return (static_cast<uint64_t>(std::min(a, b)) << 32) | static_cast<uint32_t>(std::max(a, b));
+    };
+    for (size_t fi = 0; fi < polys.size(); ++fi) {
+        const auto& p = polys[fi];
+        const size_t pn = p.size();
+        if (pn < 3) continue;
+        for (size_t i = 0; i < pn; ++i) {
+            uint32_t a = p[i], b = p[(i + 1) % pn];
+            if (a == b) continue;
+            uint32_t free_v = INVALID_INDEX;
+            for (size_t k = 0; k < pn; ++k) {
+                if (p[k] != a && p[k] != b) { free_v = p[k]; break; }
+            }
+            uint64_t k2 = key2(a, b);
+            auto it = emap.find(k2);
+            if (it == emap.end()) {
+                ER r; r.f0 = static_cast<uint32_t>(fi); r.w0 = free_v;
+                emap.emplace(k2, r);
+            } else if (it->second.f1 == INVALID_INDEX) {
+                it->second.f1 = static_cast<uint32_t>(fi);
+                it->second.w1 = free_v;
+            }
+        }
+    }
+    auto newell = [&](size_t fi) -> Vec3f {
+        const auto& p = polys[fi];
+        Vec3d n = Vec3d::Zero();
+        const size_t pn = p.size();
+        for (size_t i = 0; i < pn; ++i) {
+            Vec3d a = POS[p[i]].cast<double>();
+            Vec3d b = POS[p[(i + 1) % pn]].cast<double>();
+            n += a.cross(b);
+        }
+        double ln = n.norm();
+        return ln > 1e-14 ? (n / ln).cast<float>() : Vec3f(0, 0, 0);
+    };
+    std::vector<Vec3f> fn(polys.size());
+    for (size_t fi = 0; fi < fn.size(); ++fi) fn[fi] = newell(fi);
+
+    for (const auto& [k2, r] : emap) {
+        if (r.f0 == INVALID_INDEX || r.f1 == INVALID_INDEX) continue;
+        if (r.w0 == INVALID_INDEX || r.w1 == INVALID_INDEX) continue;
+        if (r.w0 >= POS.size() || r.w1 >= POS.size()) continue;
+        const double d = std::max(-1.0, std::min(1.0, static_cast<double>(fn[r.f0].dot(fn[r.f1]))));
+        const float dih = static_cast<float>(std::acos(d) * 180.0 / PI_D);
+        const uint32_t a = static_cast<uint32_t>(k2 >> 32);
+        const uint32_t b = static_cast<uint32_t>(k2 & 0xFFFFFFFFu);
+        if (a >= POS.size() || b >= POS.size()) continue;
+        Vec3f e = POS[b] - POS[a];
+        const float el = e.norm();
+        if (el < 1e-9f) continue;
+        e = e / el;
+        const Vec3f mid = 0.5f * (POS[a] + POS[b]);
+        Vec3f u0 = POS[r.w0] - mid, u1 = POS[r.w1] - mid;
+        u0 -= u0.dot(e) * e;
+        u1 -= u1.dot(e) * e;
+        if (u0.dot(u1) <= 0.0f) continue;      // opposite sides = flat continuation
+        out.sameside++;
+        if (dih > 120.0f) out.gated++;
+    }
+    return out;
+}
 } // namespace
 
 
@@ -1375,24 +1454,20 @@ void Stage5ParamAndExtract::weld_and_inherit_attributes(
 ) {
     if (out_quads.positions.empty() || out_quads.polygons.empty()) return;
 
-    // Filter duplicate quads and zero-area degenerates (vertices are already topologically shared)
+    // T15: this step NEVER moves positions (the spatial-hash positional weld lived here until
+    // 84f1049 and is long gone), so any pleat change across it is an ADJACENCY effect of dropping
+    // faces - the metric re-pairs edges - and not new folded geometry. Two phases so the effect
+    // is attributable: (1) consecutive-duplicate cleanup + validity drops (degenerate, or non-quad
+    // when triangles are not allowed), (2) duplicate-quad drop keeping the FIRST occurrence -
+    // byte-identical result to the previous single interleaved pass.
     std::vector<std::vector<uint32_t>> valid_polys;
     std::vector<uint16_t> valid_mats;
     valid_polys.reserve(out_quads.polygons.size());
     valid_mats.reserve(out_quads.material_ids.size());
-    std::unordered_set<uint64_t> seen_quad_keys;
-
-    auto make_quad_key = [](uint32_t a, uint32_t b, uint32_t c, uint32_t d) -> uint64_t {
-        uint32_t arr[4] = { a, b, c, d };
-        std::sort(arr, arr + 4);
-        return (static_cast<uint64_t>(arr[0]) * 73856093) ^
-               (static_cast<uint64_t>(arr[1]) * 19349663) ^
-               (static_cast<uint64_t>(arr[2]) * 83492791) ^
-               (static_cast<uint64_t>(arr[3]) * 31415926);
-    };
+    const size_t polys_in = out_quads.polygons.size();
 
     for (size_t p_idx = 0; p_idx < out_quads.polygons.size(); ++p_idx) {
-        auto& poly = out_quads.polygons[p_idx];
+        const auto& poly = out_quads.polygons[p_idx];
 
         std::vector<uint32_t> cleaned;
         cleaned.reserve(poly.size());
@@ -1415,22 +1490,55 @@ void Stage5ParamAndExtract::weld_and_inherit_attributes(
                 }
             }
             if (all_distinct && (cleaned.size() == 4 || ctx.params->allow_triangles)) {
-                if (cleaned.size() == 4) {
-                    uint64_t qk = make_quad_key(cleaned[0], cleaned[1], cleaned[2], cleaned[3]);
-                    if (seen_quad_keys.insert(qk).second) {
-                        valid_polys.push_back(std::move(cleaned));
-                        valid_mats.push_back(p_idx < out_quads.material_ids.size() ? out_quads.material_ids[p_idx] : 0);
-                    }
-                } else {
-                    valid_polys.push_back(std::move(cleaned));
-                    valid_mats.push_back(p_idx < out_quads.material_ids.size() ? out_quads.material_ids[p_idx] : 0);
-                }
+                valid_polys.push_back(std::move(cleaned));
+                valid_mats.push_back(p_idx < out_quads.material_ids.size() ? out_quads.material_ids[p_idx] : 0);
             }
         }
     }
+    {
+        const PleatCounts pc = count_pleats_t15(out_quads.positions, valid_polys);
+        std::cout << "[stage5/t15] stage=post_invalid polys=" << valid_polys.size()
+                  << " pleats_gated=" << pc.gated << " pleats_sameside=" << pc.sameside
+                  << " dropped_invalid=" << (polys_in - valid_polys.size()) << std::endl;
+    }
 
-    out_quads.polygons = std::move(valid_polys);
-    out_quads.material_ids = std::move(valid_mats);
+    std::vector<std::vector<uint32_t>> final_polys;
+    std::vector<uint16_t> final_mats;
+    final_polys.reserve(valid_polys.size());
+    final_mats.reserve(valid_mats.size());
+    std::unordered_set<uint64_t> seen_quad_keys;
+
+    auto make_quad_key = [](uint32_t a, uint32_t b, uint32_t c, uint32_t d) -> uint64_t {
+        uint32_t arr[4] = { a, b, c, d };
+        std::sort(arr, arr + 4);
+        return (static_cast<uint64_t>(arr[0]) * 73856093) ^
+               (static_cast<uint64_t>(arr[1]) * 19349663) ^
+               (static_cast<uint64_t>(arr[2]) * 83492791) ^
+               (static_cast<uint64_t>(arr[3]) * 31415926);
+    };
+
+    for (size_t i = 0; i < valid_polys.size(); ++i) {
+        auto& poly = valid_polys[i];
+        if (poly.size() == 4) {
+            uint64_t qk = make_quad_key(poly[0], poly[1], poly[2], poly[3]);
+            if (seen_quad_keys.insert(qk).second) {
+                final_polys.push_back(std::move(poly));
+                final_mats.push_back(valid_mats[i]);
+            }
+        } else {
+            final_polys.push_back(std::move(poly));
+            final_mats.push_back(valid_mats[i]);
+        }
+    }
+    {
+        const PleatCounts pc = count_pleats_t15(out_quads.positions, final_polys);
+        std::cout << "[stage5/t15] stage=post_dedupe polys=" << final_polys.size()
+                  << " pleats_gated=" << pc.gated << " pleats_sameside=" << pc.sameside
+                  << " dropped_duplicate=" << (valid_polys.size() - final_polys.size()) << std::endl;
+    }
+
+    out_quads.polygons = std::move(final_polys);
+    out_quads.material_ids = std::move(final_mats);
 }
 
 // ---------------------------------------------------------------------------
@@ -2659,6 +2767,17 @@ QrmStatus Stage5ParamAndExtract::execute(
     if (const char* e = std::getenv("QREMESH_T17")) {
         if (std::atoi(e) != 0)
             t17_paired_probe(ctx, out_quads, face_patch, t17_cross, t17_ov, t17_gp);
+    }
+
+    // T15 (S45 claim "the weld doubles the folds"): measure the SAME mesh with BOTH pleat
+    // definitions on both sides of the filter, so the 546-vs-1855 gap decomposes into a
+    // definition gap and a filter effect instead of being quoted from two different metrics.
+    ctx.dump_quads_obj("stage5_preweld", out_quads);
+    {
+        const PleatCounts pc = count_pleats_t15(out_quads.positions, out_quads.polygons);
+        std::cout << "[stage5/t15] stage=pre_weld polys=" << out_quads.polygons.size()
+                  << " pleats_gated=" << pc.gated << " pleats_sameside=" << pc.sameside
+                  << " verts=" << out_quads.positions.size() << std::endl;
     }
 
     weld_and_inherit_attributes(ctx, out_quads);
