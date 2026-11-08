@@ -1597,10 +1597,100 @@ QrmStatus Stage5ParamAndExtract::execute(
         loop_paths_total += patch.boundary_loop.size();
     }
 
-    for (const auto& patch : graph.patches) {
+    // Diagnostic for S45 (where do the folds come from): face -> patch attribution, so a pleat
+    // edge can be classified as INTRA-patch (the fill itself folds) or CROSS-patch (a seam).
+    std::vector<uint32_t> face_patch;
+    for (size_t p = 0; p < graph.patches.size(); ++p) {
+        const auto& patch = graph.patches[p];
         size_t before = out_quads.polygons.size();
         extract_patch_quads(ctx, patch, graph, out_quads);
         quads_from_loops += out_quads.polygons.size() - before;
+        for (size_t f = before; f < out_quads.polygons.size(); ++f) face_patch.push_back(static_cast<uint32_t>(p));
+    }
+
+    // Winding-independent pleat census: two faces on the SAME side of their shared edge with a
+    // normal angle > 120 deg are folded onto each other (see test_out/pleat_count.py).
+    // NOTE: stage5 runs more than once (the budget calibration pass), so this line repeats -
+    // the LAST occurrence is the shipped mesh. Kept unconditional because execute() has no
+    // knowledge of which pass it is (the override flag lives in balance_and_quantize_patch_sizes).
+    {
+        struct EdgeRec { uint32_t f0 = INVALID_INDEX, f1 = INVALID_INDEX;
+                         uint32_t w0 = INVALID_INDEX, w1 = INVALID_INDEX; };
+        std::unordered_map<uint64_t, EdgeRec> emap;
+        auto key2 = [](uint32_t a, uint32_t b) -> uint64_t {
+            return (static_cast<uint64_t>(std::min(a, b)) << 32) | static_cast<uint32_t>(std::max(a, b));
+        };
+        const auto& POS = out_quads.positions;
+        for (size_t fi = 0; fi < out_quads.polygons.size(); ++fi) {
+            const auto& p = out_quads.polygons[fi];
+            const size_t pn = p.size();
+            if (pn < 3) continue;
+            for (size_t i = 0; i < pn; ++i) {
+                uint32_t a = p[i], b = p[(i + 1) % pn];
+                if (a == b) continue;
+                uint32_t free_v = INVALID_INDEX;
+                for (size_t k = 0; k < pn; ++k) {
+                    if (p[k] != a && p[k] != b) { free_v = p[k]; break; }
+                }
+                uint64_t k2 = key2(a, b);
+                auto it = emap.find(k2);
+                if (it == emap.end()) {
+                    EdgeRec r; r.f0 = static_cast<uint32_t>(fi); r.w0 = free_v;
+                    emap.emplace(k2, r);
+                } else if (it->second.f1 == INVALID_INDEX) {
+                    it->second.f1 = static_cast<uint32_t>(fi);
+                    it->second.w1 = free_v;
+                }
+            }
+        }
+        auto newell = [&](size_t fi) -> Vec3f {
+            const auto& p = out_quads.polygons[fi];
+            Vec3d n = Vec3d::Zero();
+            const size_t pn = p.size();
+            for (size_t i = 0; i < pn; ++i) {
+                Vec3d a = POS[p[i]].cast<double>();
+                Vec3d b = POS[p[(i + 1) % pn]].cast<double>();
+                n += a.cross(b);
+            }
+            double ln = n.norm();
+            return ln > 1e-14 ? (n / ln).cast<float>() : Vec3f(0, 0, 0);
+        };
+        std::vector<Vec3f> fn(out_quads.polygons.size());
+        for (size_t fi = 0; fi < fn.size(); ++fi) fn[fi] = newell(fi);
+
+        size_t pleat = 0, pleat_intra = 0, pleat_cross = 0, folded_faces = 0;
+        std::unordered_map<uint32_t, uint32_t> per_patch;
+        for (const auto& [k2, r] : emap) {
+            if (r.f0 == INVALID_INDEX || r.f1 == INVALID_INDEX) continue;
+            if (r.w0 == INVALID_INDEX || r.w1 == INVALID_INDEX) continue;
+            double dot = std::max(-1.0, std::min(1.0, static_cast<double>(fn[r.f0].dot(fn[r.f1]))));
+            float dih = static_cast<float>(std::acos(dot) * 180.0 / PI_D);
+            if (dih <= 120.0f) continue;
+            uint32_t a = static_cast<uint32_t>(k2 >> 32), b = static_cast<uint32_t>(k2 & 0xFFFFFFFFu);
+            Vec3f e = POS[b] - POS[a];
+            float el = e.norm();
+            if (el < 1e-9f) continue;
+            e = e / el;
+            Vec3f mid = 0.5f * (POS[a] + POS[b]);
+            Vec3f u0 = POS[r.w0] - mid, u1 = POS[r.w1] - mid;
+            u0 -= u0.dot(e) * e;
+            u1 -= u1.dot(e) * e;
+            if (u0.dot(u1) <= 0.0f) continue;      // opposite sides = flat continuation
+            pleat++;
+            const uint32_t pa = (r.f0 < face_patch.size()) ? face_patch[r.f0] : INVALID_INDEX;
+            const uint32_t pb = (r.f1 < face_patch.size()) ? face_patch[r.f1] : INVALID_INDEX;
+            if (pa == pb) { pleat_intra++; if (pa != INVALID_INDEX) per_patch[pa]++; }
+            else pleat_cross++;
+            folded_faces += 2;
+        }
+        size_t worst_n = 0; uint32_t worst_p = INVALID_INDEX; double sum_sq = 0.0;
+        for (const auto& [p, c] : per_patch) { sum_sq += static_cast<double>(c) * c; if (c > worst_n) { worst_n = c; worst_p = p; } }
+        std::cout << "[stage5/pleatmap] pleats=" << pleat
+                  << " intra_patch=" << pleat_intra << " cross_patch=" << pleat_cross
+                  << " patches_with_pleats=" << per_patch.size()
+                  << "/" << graph.patches.size()
+                  << " worst_patch=" << worst_p << "(" << worst_n << ")"
+                  << " giniish_sum_sq=" << sum_sq << std::endl;
     }
 
     polys_before_weld = static_cast<int64_t>(out_quads.polygons.size());
