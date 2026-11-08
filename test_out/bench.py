@@ -70,11 +70,12 @@ METRICS = {
     "min_sj": "max", "median_sj": "max", "rms_pct": "min", "hausdorff_pct": "min",
     "boundary_pct": "min", "nonmanifold": "min", "components_dist": "min",
     "crease_per_1k": "min", "pleat_pct": "min", "winding_conflicts": "min",
+    "silhouette_iou": "max",
     "time_s": "time",
 }
 LOWER_BETTER = {"rms_pct", "hausdorff_pct", "boundary_pct", "nonmanifold", "components_dist",
                 "crease_per_1k", "pleat_pct", "winding_conflicts", "time_s"}
-HIGHER_BETTER = {"min_sj", "median_sj"}
+HIGHER_BETTER = {"min_sj", "median_sj", "silhouette_iou"}
 
 
 # --------------------------------------------------------------------- source-side memo ---------
@@ -97,7 +98,6 @@ def src_side(src_path, rel=0.01, gate=30.0):
 
 def fold_metrics(out_path, src_path):
     """Creases on locally-smooth source (per 1k faces) + same-side pleat rate of interior edges."""
-    from collections import defaultdict
     V, po = load_polys(out_path)
     N = face_normals(V, po)
     maxd, _ = edge_dihedrals(V, po, N)
@@ -151,11 +151,43 @@ def winding_conflicts_of(path):
 
 
 # ------------------------------------------------------------------------ runner ----------------
+# The silhouette IoU is the SEMANTIC guard the shape-aware spec asked for: it catches gross shape
+# loss that every geometric metric stays silent about. It is a guard, not an objective - measured:
+# it saturates (0.9682 for both the 3k and the 10k output of the same model), so it cannot rank
+# quality, only veto a candidate that cuts a hole or shears a limb.
+SIL_VIEWS = int(os.environ.get("BENCH_SIL_VIEWS", "12"))
+SIL_RES = int(os.environ.get("BENCH_SIL_RES", "256"))
+
+
+def silhouette_iou(out_path, src_path):
+    import shape_probe as sp
+    src_mask_cache = os.path.join(CACHE_DIR, "srcmasks-%s-%dx%d.npz" % (
+        hashlib.sha256((src_path + str(int(os.stat(src_path).st_mtime))).encode()).hexdigest()[:12],
+        SIL_VIEWS, SIL_RES))
+    Vs, ps = load_polys(src_path)
+    views = sp._views(SIL_VIEWS)
+    frames = sp.silhouette_frames(Vs, views, SIL_RES)
+    if os.path.exists(src_mask_cache):
+        arr = np.load(src_mask_cache)
+        ms = [arr[str(i)] for i in range(len(views))]
+    else:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        ms = sp.silhouette_masks(Vs, sp.fan_tris(ps), views, SIL_RES, 1, frames)
+        np.savez_compressed(src_mask_cache, **{str(i): m for i, m in enumerate(ms)})
+    Vo, po = load_polys(out_path)
+    mo = sp.silhouette_masks(Vo, sp.fan_tris(po), views, SIL_RES, 1, frames)
+    ious = []
+    for a, b in zip(mo, ms):
+        union = np.logical_or(a, b).sum()
+        ious.append(float(np.logical_and(a, b).sum() / union) if union else 1.0)
+    return float(np.mean(ious))
+
+
 def run_cell(model, config, budget, force=False):
     m = MODELS[model]
     cfg = CONFIGS[config]
     os.makedirs(CACHE_DIR, exist_ok=True)
-    tag = hashlib.sha256(json.dumps({"m": model, "c": config, "b": budget, "cli": _cli_stamp()},
+    tag = hashlib.sha256(json.dumps({"v": 2, "m": model, "c": config, "b": budget, "cli": _cli_stamp()},
                                     sort_keys=True).encode()).hexdigest()[:16]
     cf = os.path.join(CACHE_DIR, f"{tag}.json")
     if os.path.exists(cf) and not force:
@@ -195,9 +227,15 @@ def run_cell(model, config, budget, force=False):
         "time_s": round(time.time() - t0, 2),
         "md5": _md5(out),
     }
+    res["crease_per_1k"], res["pleat_pct"] = 0.0, 0.0
     fm = fold_metrics(out, os.path.join(ROOT, m["src"]))
     res.update(fm)
     res["winding_conflicts"] = winding_conflicts_of(out)
+    try:
+        res["silhouette_iou"] = round(silhouette_iou(out, os.path.join(ROOT, m["src"])), 4)
+    except Exception as exc:                      # never lose the geometric metrics over a render
+        res["silhouette_iou"] = 0.0
+        print(f"  warn: silhouette_iou failed: {exc}", file=sys.stderr)
     json.dump(res, open(cf, "w"), indent=1)
     return res
 
@@ -269,8 +307,8 @@ def verdict(ref_rows, cand_rows):
 
 def table(rows):
     cols = ["budget", "config", "polys", "triangles", "median_sj", "min_sj", "hausdorff_pct",
-            "rms_pct", "boundary_pct", "crease_per_1k", "pleat_pct", "winding_conflicts",
-            "components_dist", "time_s"]
+            "rms_pct", "boundary_pct", "crease_per_1k", "pleat_pct", "silhouette_iou",
+            "winding_conflicts", "components_dist", "time_s"]
     print("  " + " ".join(f"{c:>15}" for c in cols))
     for r in sorted(rows, key=lambda x: (x["config"], x["budget"])):
         print("  " + " ".join(f"{r[c]:>15.4g}" if isinstance(r[c], float) else f"{r[c]:>15}"
@@ -316,9 +354,9 @@ def main():
         print(f"  {'metric':>18} {'base_median':>12} {'median_delta':>13} {'delta_range':>18} "
               f"{'signs':>22}  verdict")
         v = verdict(rows[a.ref], rows[a.cand])
-        order = ["crease_per_1k", "pleat_pct", "median_sj", "min_sj", "hausdorff_pct", "rms_pct",
-                 "boundary_pct", "winding_conflicts", "components_dist", "nonmanifold",
-                 "polys", "triangles", "time_s"]
+        order = ["crease_per_1k", "pleat_pct", "silhouette_iou", "median_sj", "min_sj",
+                 "hausdorff_pct", "rms_pct", "boundary_pct", "winding_conflicts",
+                 "components_dist", "nonmanifold", "polys", "triangles", "time_s"]
         incon = 0
         for mt in order:
             if mt not in v:

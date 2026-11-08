@@ -28,3 +28,6 @@ test_out/*.obj
 test_out/*.png
 test_out/*.json
 test_out/dumps_*/
+
+# bench run cache (regenerable)
+test_out/.bench/
