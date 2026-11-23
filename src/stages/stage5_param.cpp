@@ -1397,13 +1397,38 @@ void Stage5ParamAndExtract::extract_patch_quads(
     //     move the new point is snapped back onto the SOURCE surface (original_bvh closest
     //     point). Snapping every node keeps the sheet glued to the geometry and orthogonal-
     //     ising the cells, which is what lifts Scaled Jacobian and kills aspect.
-    // QREMESH_HARMONIC_ITERS overrides the iteration count.
-    int harmonic_iters = 16;
+    // Fewer default sweeps preserve short-wavelength relief. The environment override
+    // remains available for quality/performance A/B tests.
+    int harmonic_iters = 8;
     if (const char* e = std::getenv("QREMESH_HARMONIC_ITERS")) {
         int v = std::atoi(e);
         if (v >= 0) harmonic_iters = v;
     }
     const bool snap_final_only = std::getenv("QREMESH_SNAP_FINAL") != nullptr;  // S30 theory
+    // Constrain the query to this patch first. The global source BVH contains every nearby
+    // shell; querying it directly can jump across a thin wall or a touching AI-generated part.
+    auto project_to_local_source = [&](const Vec3f& point, Vec3f& projected) -> bool {
+        if (has_patch_bvh) {
+            Vec3f patch_point, patch_normal;
+            float patch_d2 = 0.0f;
+            if (patch_bvh.closest_point(point, patch_point, patch_normal, patch_d2)) {
+                Vec3f source_point, source_normal;
+                float source_d2 = 0.0f;
+                const float lift_limit_sq = 0.5f * ctx.base_target_length * ctx.base_target_length;
+                if (ctx.original_bvh.closest_point(patch_point, source_point, source_normal, source_d2) &&
+                    source_d2 <= lift_limit_sq && source_normal.dot(patch_normal) > 0.25f) {
+                    projected = source_point;
+                } else {
+                    projected = patch_point;
+                }
+                return true;
+            }
+        }
+        // Fallback for an empty/degenerate local patch BVH.
+        Vec3f source_normal;
+        float source_d2 = 0.0f;
+        return ctx.original_bvh.closest_point(point, projected, source_normal, source_d2);
+    };
     for (int it = 0; it < harmonic_iters; ++it) {
         for (int i = 1; i < nu; ++i) {
             for (int j = 1; j < nv; ++j) {
@@ -1414,9 +1439,8 @@ void Stage5ParamAndExtract::extract_patch_quads(
                 avg *= 0.25f;
                 Vec3f p = avg;            // weight 1: full step to the neighbour mean
                 if (!snap_final_only) {
-                    Vec3f cp, cn;
-                    float d2;
-                    if (ctx.original_bvh.closest_point(p, cp, cn, d2)) p = cp;  // snap (no shrink)
+                    Vec3f projected;
+                    if (project_to_local_source(p, projected)) p = projected;
                 }
                 out_quads.positions[grid[i][j]] = p;   // Gauss-Seidel: apply immediately
             }
@@ -1431,10 +1455,9 @@ void Stage5ParamAndExtract::extract_patch_quads(
     if (snap_final_only) {
         for (int i = 1; i < nu; ++i) {
             for (int j = 1; j < nv; ++j) {
-                Vec3f cp, cn;
-                float d2;
-                if (ctx.original_bvh.closest_point(out_quads.positions[grid[i][j]], cp, cn, d2))
-                    out_quads.positions[grid[i][j]] = cp;
+                Vec3f projected;
+                if (project_to_local_source(out_quads.positions[grid[i][j]], projected))
+                    out_quads.positions[grid[i][j]] = projected;
             }
         }
     }

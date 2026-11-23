@@ -33,7 +33,7 @@ void qrm_default_params(QrmParams* p) {
     p->allow_triangles = true;
 
     p->field_smooth_iters = 50;
-    p->vertex_relax_iters = 20;
+    p->vertex_relax_iters = 6;
     p->shape_preservation = 0.90f;
 
     p->proxy_tri_threshold = 300000;

@@ -22,7 +22,7 @@ private:
     static void fill_small_boundary_holes(
         RemeshContext& ctx,
         QuadMeshResult& qmesh,
-        size_t max_hole_verts = 16
+        size_t max_hole_verts = 64
     );
 
     static void tangential_taubin_smoothing(

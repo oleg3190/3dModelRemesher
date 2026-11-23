@@ -412,12 +412,10 @@ void Stage6Optimize::fill_small_boundary_holes(
                 }
             }
         };
-        // S57: the guard's data source must be the RAW input. original_bvh is built AFTER
-        // stage0 nm-repair (keep-best-2 cut 1749 branches on the S57 model), so its
-        // single-face edges are REPAIR-INDUCED borders and the guard refused to close a
-        // real 39-vertex hole near them. QREMESH_HOLE_ORIGINPUT=1 -> raw-input silhouette;
-        // default OFF keeps the shipped behavior byte-identical.
-        bool raw_silhouette = false;
+        // original_bvh is built AFTER stage0 non-manifold repair. Its new single-face edges
+        // are repair-induced boundaries, not the input's legitimate open silhouette. Use
+        // raw input topology by default; set QREMESH_HOLE_ORIGINPUT=0 for legacy behavior.
+        bool raw_silhouette = true;
         if (const char* e = std::getenv("QREMESH_HOLE_ORIGINPUT")) raw_silhouette = (std::atoi(e) != 0);
         if (raw_silhouette && ctx.in_mesh) {
             const QrmMeshIn* in = ctx.in_mesh;
@@ -463,46 +461,40 @@ void Stage6Optimize::fill_small_boundary_holes(
     size_t rejected_too_big = 0;
     size_t rejected_non_simple = 0;
 
-    // S57 knobs (sew-the-seams on a watertight model): both default OFF => baseline
-    // byte-identical. QREMESH_HOLE_LIMIT overrides the hard-coded 30-vertex cap - a real
-    // hole LARGER than the cap was skipped silently (the S57 model has a 39-vertex loop).
-    // QREMESH_HOLE_PINCH switches to a directed boundary walk that rotates around degree-4
-    // vertices: the naive adjacency walk marks any loop touching a pinch as "non-simple"
-    // and drops it with no counter (S42 lesson: a silent rejection hides the defect) -
-    // that is why small loops stayed open on the S57 model.
+    // The directed boundary walk handles loops that touch at pinch vertices. Keep a
+    // conservative 64-vertex cap; both settings remain overridable for A/B testing.
+    // QREMESH_HOLE_LIMIT=<n> changes the cap; QREMESH_HOLE_PINCH=0 restores legacy tracing.
     size_t hole_limit = max_hole_verts;
     if (const char* e = std::getenv("QREMESH_HOLE_LIMIT")) {
         const int v = std::atoi(e);
         if (v >= 4) hole_limit = static_cast<size_t>(v);
     }
-    bool pinch_mode = false;
+    bool pinch_mode = true;
     if (const char* e = std::getenv("QREMESH_HOLE_PINCH")) pinch_mode = (std::atoi(e) != 0);
 
     // Fill ONE traced loop: legit-open-border guard, then a quad fan around a source-snapped
     // centroid. Factored out of the naive walk so the directed (pinch) walker reuses it.
     auto fill_loop = [&](const std::vector<uint32_t>& loop) {
         if (loop.size() < 3 || loop.size() > hole_limit) return;
-        // Legit-open-border guard: skip unless the loop is a MICRO nick. Count how many
-        // vertices sit on the original silhouette.
-        {
+        // Preserve raw-input openings only when the caller requests open borders.
+        // For AI assets that must become closed solids, setting this option false lets
+        // Stage 6 repair source holes as well (Stage 0 uses the same option).
+        if (ctx.params->preserve_open_borders) {
             size_t on_border = 0;
             for (uint32_t lv : loop) if (vertex_on_open_border(lv)) on_border++;
-            // Real open border = a LONG chain whose every vertex lies on the original
-            // silhouette. Welding-jitter false positives are short and only partly
-            // on-border, so requiring ALL verts on border AND a minimum length keeps
-            // the guard protective (caps nothing on a genuine open edge) yet inert on
-            // watertight models (their few flagged edges are jitter, not silhouette).
             const size_t MIN_BORDER_LOOP = 12;
             if (on_border == loop.size() && loop.size() >= MIN_BORDER_LOOP) {
                 border_preserved++;
                 return;
             }
         }
-        // Compute average neighbor normal to ensure correct winding
+        // Use the actual ordered loop edges. At a pinch vertex bnd_adj[lv][0] may belong
+        // to a different sub-loop, producing a wrong cap winding for figure-eight boundaries.
         Vec3f avg_normal = Vec3f::Zero();
-        for (uint32_t lv : loop) {
-            uint32_t nbr_v = bnd_adj[lv][0];
-            uint64_t k = (static_cast<uint64_t>(std::min(lv, nbr_v)) << 32) | std::max(lv, nbr_v);
+        for (size_t i = 0; i < loop.size(); ++i) {
+            const uint32_t lv = loop[i];
+            const uint32_t nbr_v = loop[(i + 1) % loop.size()];
+            const uint64_t k = (static_cast<uint64_t>(std::min(lv, nbr_v)) << 32) | std::max(lv, nbr_v);
             auto it = edge_to_faces.find(k);
             if (it != edge_to_faces.end()) {
                 for (uint32_t fi : it->second) {
@@ -538,8 +530,14 @@ void Stage6Optimize::fill_small_boundary_holes(
             for (uint32_t lv : loop) c += qmesh.positions[lv];
             c /= static_cast<float>(loop.size());
             Vec3f cp, cn;
-            float d2;
-            if (ctx.original_bvh.closest_point(c, cp, cn, d2)) c = cp;
+            float d2 = 0.0f;
+            // Avoid snapping the cap center onto a different nearby sheet (thin walls and
+            // self-touching AI meshes). Snap only when the source is close and normals agree.
+            const float snap_limit_sq = 0.25f * ctx.base_target_length * ctx.base_target_length;
+            if (ctx.original_bvh.closest_point(c, cp, cn, d2) &&
+                d2 <= snap_limit_sq && cn.dot(avg_normal) > 0.5f) {
+                c = cp;
+            }
             uint32_t c_idx = static_cast<uint32_t>(qmesh.positions.size());
             qmesh.positions.push_back(c);
             size_t L = loop.size();
@@ -777,11 +775,23 @@ void Stage6Optimize::tangential_taubin_smoothing(
 
     float max_dev = ctx.params->max_surface_deviation * 0.01f * ctx.bbox_diag;
     int effective_iters = std::max(iters + 3, 8);
+    // Conservative defaults retain local relief. Environment values are validated and
+    // bounded so accidental values cannot turn this pass into an unrestricted smoother.
+    float step_factor = 0.20f;
+    if (const char* e = std::getenv("QREMESH_RELAX_STEP")) {
+        const float v = static_cast<float>(std::atof(e));
+        if (v > 0.0f && v <= 0.4f) step_factor = v;
+    }
+    float slide_cap_ratio = 0.35f;
+    if (const char* e = std::getenv("QREMESH_RELAX_CAP")) {
+        const float v = static_cast<float>(std::atof(e));
+        if (v > 0.0f && v <= 1.0f) slide_cap_ratio = v;
+    }
 
     // Forward Laplacian relaxation with an ANCHOR cap: every vertex keeps its position
-    // from the start of the relaxation as an anchor and may travel at most 60% of its
-    // shortest incident edge. Without the cap the smoother slides vertices off small
-    // features (rails, brackets, rims) while staying on the source surface - erodes detail.
+    // from the start of the relaxation as an anchor and may travel at most slide_cap_ratio
+    // of its shortest incident edge. The cap prevents migration along and erosion of small
+    // features (rails, brackets, rims) while staying on the source surface.
     const std::vector<Vec3f> anchor = qmesh.positions;
     std::vector<float> slide_cap(nv, 0.0f);
     for (const auto& poly : qmesh.polygons) {
@@ -792,7 +802,7 @@ void Stage6Optimize::tangential_taubin_smoothing(
             if (u >= nv || w >= nv) continue;
             float len = (anchor[u] - anchor[w]).norm();
             if (len > 1e-9f) {
-                float c = 0.60f * len;
+                float c = slide_cap_ratio * len;
                 if (slide_cap[u] <= 0.0f || c < slide_cap[u]) slide_cap[u] = c;
                 if (slide_cap[w] <= 0.0f || c < slide_cap[w]) slide_cap[w] = c;
             }
@@ -803,7 +813,6 @@ void Stage6Optimize::tangential_taubin_smoothing(
         // Forward (lambda) step only: the mu counter-step was tried and it amplifies
         // micro-irregularities -> the surface crinkles (area +20%) without moving off
         // the source. The anchor cap below already protects against shrinkage/erosion.
-        const float step_factor = 0.40f;
         std::vector<Vec3f> new_positions = qmesh.positions;
 
         tbb::parallel_for(tbb::blocked_range<uint32_t>(0, nv), [&](const tbb::blocked_range<uint32_t>& r) {
@@ -2673,7 +2682,7 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     };
     log_area("entry");
 
-    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 30); log_area("after_fill"); }
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 64); log_area("after_fill"); }
     cleanup_topology(qmesh);
     log_area("after_cleanup");
     tangential_taubin_smoothing(ctx, qmesh, relax_iters);
@@ -2682,7 +2691,7 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
     log_area("after_cleanup2");
     if (!skip_untangle) { untangle_low_jacobians(ctx, qmesh); log_area("after_untangle"); }
     // Second fill pass: cleanup/untangle can open small holes after the first pass
-    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 30); log_area("after_fill2"); }
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 64); log_area("after_fill2"); }
 
     // Final exact-position weld & manifold/degenerate face sanitizer
     {
@@ -2843,7 +2852,7 @@ QrmStatus Stage6Optimize::execute(RemeshContext& ctx, QuadMeshResult& qmesh) {
 
     // Final fill: the exact-position weld / degenerate-face sanitizer above can open
     // holes again after the previous passes
-    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 30); log_area("after_fill3"); }
+    if (!skip_holefill) { fill_small_boundary_holes(ctx, qmesh, 64); log_area("after_fill3"); }
 
     // Drop microscopic disconnected islands (closed shells below 0.5% of the largest
     // shell's area): leftovers of tiny sliver patches that show up as stray components
