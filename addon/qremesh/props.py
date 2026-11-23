@@ -127,8 +127,8 @@ class QRemeshProperties(bpy.types.PropertyGroup):
 
     vertex_relax_iters: IntProperty(
         name="Relax Iterations",
-        description="Number of iterations for Taubin tangential smoothing",
-        default=20,
+        description="Conservative tangential relaxation iterations (lower values preserve small details)",
+        default=6,
         min=0,
         max=100,
     )

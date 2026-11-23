@@ -89,6 +89,8 @@ int main(int argc, char** argv) {
                   << "         --single-shell / --drop-islands[=on|off]  final island drop\n"
                   << "         --rewind=on|off / --no-rewind   face-orientation majority fix (DEFAULT on;\n"
                   << "                                         geometry untouched, no-op on orientable input)\n"
+                  << "         --preserve-open-borders=on|off  preserve raw open boundaries (DEFAULT on)\n"
+                  << "         --fill-open-boundaries         alias for --preserve-open-borders=off\n"
                   << "Priority: explicit flag > --quality preset > QREMESH_* env > built-in default(off).\n"
                   << "--quality never changes the polygon target.\n";
         return 0;
@@ -101,6 +103,7 @@ int main(int argc, char** argv) {
     // Start every repair field at -1 (auto): only explicit flags / a preset make them
     // authoritative; otherwise the library falls back to env then OFF (baseline preserved).
     int8_t nm_keep_best = -1, drop_debris = -1, drop_islands = -1, rewind_faces = -1;
+    int8_t preserve_open_borders = -1;
     float weld_scale = 0.0f;
 
     auto needs_val = [&](int i) -> bool { return i + 1 < argc; };
@@ -133,6 +136,9 @@ int main(int argc, char** argv) {
         else if (a == "--single-shell" || a == "--drop-islands") drop_islands = 1;
         else if (a.rfind("--rewind=", 0) == 0) rewind_faces = (a.substr(9) == "off") ? 0 : 1;
         else if (a == "--no-rewind") rewind_faces = 0;
+        else if (a == "--fill-open-boundaries") preserve_open_borders = 0;
+        else if (a.rfind("--preserve-open-borders=", 0) == 0)
+            preserve_open_borders = (a.substr(24) == "off") ? 0 : 1;
         else if (a.rfind("--drop-islands=", 0) == 0) drop_islands = (a.substr(15) == "off") ? 0 : 1;
         else if (a.rfind("--dump=", 0) == 0) dump_dir = a.substr(7);
         else if (a.rfind("--density=", 0) == 0) density_override = std::atof(a.substr(10).c_str());
@@ -204,6 +210,7 @@ int main(int argc, char** argv) {
     QrmParams params;
     qrm_default_params(&params);
     params.target_quad_count = target_quads;
+    if (preserve_open_borders >= 0) params.preserve_open_borders = (preserve_open_borders != 0);
     params.nm_keep_best = nm_keep_best;
     params.drop_debris = drop_debris;
     params.drop_islands = drop_islands;
