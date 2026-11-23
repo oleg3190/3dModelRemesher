@@ -25,6 +25,10 @@ class VIEW3D_PT_qremesh(bpy.types.Panel):
         op = row.operator("qremesh.apply_preset", text="Fast")
         op.preset_name = "Fast_Sculpt"
 
+        row = layout.row(align=True)
+        op = row.operator("qremesh.apply_preset", text="Vehicle / High Detail")
+        op.preset_name = "Vehicle_HighDetail"
+
         layout.separator()
 
         # Main remesh button
@@ -40,6 +44,8 @@ class VIEW3D_PT_qremesh(bpy.types.Panel):
         if props.target_quad_count == 0:
             col.prop(props, "target_edge_length")
         col.prop(props, "adaptive_density", slider=True)
+        col.prop(props, "max_surface_deviation")
+        col.prop(props, "proxy_tri_threshold")
         col.prop(props, "exact_quad_count")
         col.prop(props, "allow_triangles")
 
