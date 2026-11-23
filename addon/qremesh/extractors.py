@@ -33,10 +33,12 @@ def extract_mesh_data(obj, settings):
 
     seam_mask = np.zeros(ne, dtype=bool)
     if ne > 0:
-        if mesh.attributes and ".uv_seam" in mesh.attributes:
-            mesh.attributes[".uv_seam"].data.foreach_get("value", seam_mask)
-        elif mesh.attributes and "use_seam" in mesh.attributes:
-            mesh.attributes["use_seam"].data.foreach_get("value", seam_mask)
+        seam_attr = mesh.attributes.get("uv_seam") if mesh.attributes else None
+        # Accept the private legacy name only as a compatibility fallback.
+        if seam_attr is None and mesh.attributes:
+            seam_attr = mesh.attributes.get(".uv_seam")
+        if seam_attr is not None:
+            seam_attr.data.foreach_get("value", seam_mask)
         elif hasattr(mesh.edges[0], "use_seam"):
             mesh.edges.foreach_get("use_seam", seam_mask)
 
@@ -186,8 +188,12 @@ def extract_guide_curves(obj=None):
                                     "weight": 1.0,
                                 })
 
-    # 2. Extract active Annotation layers (classic world-space fallback)
-    anim_data = bpy.context.scene.annotation_data
+    # 2. Extract active Annotation layers. Blender 5.2 exposes the datablock as
+    # Scene.annotation; retain the legacy name as a guarded fallback for older releases.
+    scene = bpy.context.scene
+    anim_data = getattr(scene, "annotation", None)
+    if anim_data is None:
+        anim_data = getattr(scene, "annotation_data", None)
     if anim_data:
         for layer in anim_data.layers:
             if not layer.active_frame:
