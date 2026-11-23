@@ -1,1 +1,1 @@
-/usr/bin/c++ CMakeFiles/qremesh_cli.dir/cli/main.cpp.o -o qremesh_cli  -Wl,-rpath,/root/www/3dModelRemesher/build libqremesh_core.so 
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/qremesh_cli.dir/link.d CMakeFiles/qremesh_cli.dir/cli/main.cpp.o -o qremesh_cli  -Wl,-rpath,/home/s/my/APPS/llama/flux/3dModelRemesher/build:/home/s/my/APPS/llama/flux/3dModelRemesher/.deps/root/usr/lib/x86_64-linux-gnu libqremesh_core.so -Wl,-rpath-link,/home/s/my/APPS/llama/flux/3dModelRemesher/.deps/root/usr/lib/x86_64-linux-gnu

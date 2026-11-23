@@ -426,8 +426,15 @@ bool Stage0Prep::fix_manifold_and_orient(
 void Stage0Prep::fill_small_holes(HalfEdgeMesh& mesh, float max_hole_perimeter) {
     // Find boundary loops
     std::vector<bool> h_visited(mesh.halfedges.size(), false);
+    // add_face() below appends halfedges while we walk, so the visit bitmap has to
+    // grow with the mesh: indexing past the original size reads out of bounds
+    // (heap-buffer-overflow on vector<bool> -> corrupted free() in release builds).
+    auto sync_visited = [&]() {
+        if (h_visited.size() < mesh.halfedges.size()) h_visited.resize(mesh.halfedges.size(), false);
+    };
 
     for (size_t h_idx = 0; h_idx < mesh.halfedges.size(); ++h_idx) {
+        sync_visited();
         if (!mesh.is_valid_halfedge(static_cast<uint32_t>(h_idx))) continue;
         if (h_visited[h_idx]) continue;
         if (mesh.halfedges[h_idx].twin != INVALID_INDEX) continue; // Not boundary
@@ -439,6 +446,8 @@ void Stage0Prep::fill_small_holes(HalfEdgeMesh& mesh, float max_hole_perimeter) 
         bool closed = false;
 
         for (size_t step = 0; step < 1000; ++step) {
+            sync_visited();
+            if (curr >= h_visited.size()) break; // defensive: never index past the bitmap
             h_visited[curr] = true;
             uint32_t u = mesh.from_vertex(curr);
             uint32_t v = mesh.halfedges[curr].to_vertex;

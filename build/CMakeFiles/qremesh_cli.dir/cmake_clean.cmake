@@ -1,4 +1,5 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/qremesh_cli.dir/link.d"
   "CMakeFiles/qremesh_cli.dir/cli/main.cpp.o"
   "CMakeFiles/qremesh_cli.dir/cli/main.cpp.o.d"
   "qremesh_cli"
