@@ -1338,13 +1338,16 @@ void Stage5ParamAndExtract::extract_patch_quads(
 
     for (int i = 1; i < nu; ++i) {
         float u = static_cast<float>(i) / static_cast<float>(nu);
-        const Vec3f& c0_pt = out_quads.positions[grid[i][0]];
-        const Vec3f& c2_pt = out_quads.positions[grid[i][nv]];
+        // By value, NOT by reference: the loop below push_back()s into
+        // out_quads.positions, which reallocates the buffer and would leave
+        // references to border points dangling (heap-use-after-free).
+        const Vec3f c0_pt = out_quads.positions[grid[i][0]];
+        const Vec3f c2_pt = out_quads.positions[grid[i][nv]];
 
         for (int j = 1; j < nv; ++j) {
             float v = static_cast<float>(j) / static_cast<float>(nv);
-            const Vec3f& c3_pt = out_quads.positions[grid[0][j]];
-            const Vec3f& c1_pt = out_quads.positions[grid[nu][j]];
+            const Vec3f c3_pt = out_quads.positions[grid[0][j]];
+            const Vec3f c1_pt = out_quads.positions[grid[nu][j]];
 
             Vec3f corner_bilinear = (1.0f - u) * (1.0f - v) * P00 +
                                      u * (1.0f - v) * P10 +

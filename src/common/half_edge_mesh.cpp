@@ -515,6 +515,9 @@ bool HalfEdgeMesh::flip_edge(uint32_t e) {
     vertices[v0].halfedge = h0_prev;
     vertices[v1].halfedge = h1_prev;
 
+    // Edge e now spans (v2,v3) instead of (v0,v1): cached key->index pairs lie.
+    edge_lut.clear();
+
     return true;
 }
 
@@ -609,6 +612,9 @@ bool HalfEdgeMesh::collapse_edge(uint32_t e, const Vec3f& target_pt) {
     edges[e].is_deleted = true;
     halfedges[h0].is_deleted = true;
     if (h1 != INVALID_INDEX) halfedges[h1].is_deleted = true;
+
+    // Connectivity changed: cached (u,v) -> edge index pairs are stale from here on.
+    edge_lut.clear();
 
     vertices[v0].is_deleted = true;
     // Find any valid outgoing halfedge for v1 from its surviving faces
@@ -760,6 +766,10 @@ void HalfEdgeMesh::compact() {
             }
         }
     }
+
+    // The edge array was rebuilt (shrunk/renumbered): drop cached indices, they
+    // may now point past the end of `edges` and corrupt memory on next find_edge.
+    edge_lut.clear();
 }
 
 } // namespace qremesh

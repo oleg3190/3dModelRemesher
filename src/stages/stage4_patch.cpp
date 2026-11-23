@@ -185,7 +185,8 @@ void Stage4PatchGraph::build_quasi_quad_patches(
     for (const auto& path : separatrices) {
         for (size_t i = 0; i + 1 < path.size(); ++i) {
             uint32_t e = mesh.find_edge(path[i], path[i + 1]);
-            if (e != INVALID_INDEX) is_cut_edge[e] = true;
+            // Defensive: a stale LUT entry must never index past the edge array.
+            if (e != INVALID_INDEX && e < is_cut_edge.size()) is_cut_edge[e] = true;
         }
     }
 
