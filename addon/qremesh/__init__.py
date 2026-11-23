@@ -1,10 +1,10 @@
 bl_info = {
     "name": "QRemesh - Quad Remesher",
     "author": "QRemesh Team",
-    "version": (2, 0, 0),
+    "version": (2, 0, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > QRemesh",
-    "description": "Professional Anti-Spiral Quad Remesher with Feature & UV Preservation (Blender 4.2 LTS - 5.2 LTS)",
+    "description": "QRemesh for Blender 4.2 LTS through Blender 5.2 LTS",
     "category": "Mesh",
 }
 

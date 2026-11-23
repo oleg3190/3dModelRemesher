@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "qremesh"
-version = "2.0.0"
+version = "2.0.1"
 name = "QRemesh - Quad Remesher"
 tagline = "Professional Anti-Spiral Quad Remesher with Feature & UV Preservation"
 maintainer = "QRemesh Team"
@@ -9,7 +9,8 @@ type = "add-on"
 tags = ["Modeling", "Retopology", "Mesh"]
 
 blender_version_min = "4.2.0"
-license = ["GPL-3.0-or-later"]
+license = ["SPDX:GPL-3.0-or-later"]
 copyright = ["2026 QRemesh Team"]
 
-permissions = ["files"]
+[permissions]
+files = "Load presets and the native remeshing library from disk"

@@ -197,13 +197,13 @@ class QREMESH_OT_remesh(bpy.types.Operator):
                 seam_keys = set((smu << 32) | smv)
                 seam_mask = np.array([k in seam_keys for k in edge_keys], dtype=bool)
 
-                # Write UV seams via .uv_seam attribute (Blender 4.x / 5.2 LTS) or use_seam property
-                if ".uv_seam" in new_mesh.attributes:
-                    new_mesh.attributes[".uv_seam"].data.foreach_set("value", seam_mask)
-                elif hasattr(new_mesh.edges[0], "use_seam"):
+                # MeshEdge.use_seam is part of Blender 5.2's public Python API.
+                if hasattr(new_mesh.edges[0], "use_seam"):
                     new_mesh.edges.foreach_set("use_seam", seam_mask)
                 else:
-                    seam_attr = new_mesh.attributes.new(name=".uv_seam", type='BOOLEAN', domain='EDGE')
+                    seam_attr = new_mesh.attributes.get("uv_seam")
+                    if seam_attr is None:
+                        seam_attr = new_mesh.attributes.new(name="uv_seam", type='BOOLEAN', domain='EDGE')
                     seam_attr.data.foreach_set("value", seam_mask)
 
         # Smooth shading via face attribute (Blender 4.2 - 5.2 LTS standard)

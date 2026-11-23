@@ -1,0 +1,22 @@
+{
+    "name": "Vehicle / High Detail",
+    "target_quad_count": 20000,
+    "target_edge_length": 0.0,
+    "adaptive_density": 0.0,
+    "max_surface_deviation": 0.08,
+    "preserve_sharp_edges": true,
+    "sharp_angle_threshold": 35.0,
+    "preserve_uv_seams": true,
+    "preserve_material_borders": true,
+    "preserve_open_borders": true,
+    "symmetry_axis": "-1",
+    "symmetry_tolerance": 0.05,
+    "enforce_closed_loops": true,
+    "exact_quad_count": false,
+    "allow_triangles": true,
+    "field_smooth_iters": 50,
+    "vertex_relax_iters": 2,
+    "shape_preservation": 0.98,
+    "proxy_tri_threshold": 1000000,
+    "auto_transfer_uv": true
+}

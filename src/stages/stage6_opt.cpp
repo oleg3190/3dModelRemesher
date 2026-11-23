@@ -774,7 +774,9 @@ void Stage6Optimize::tangential_taubin_smoothing(
     }
 
     float max_dev = ctx.params->max_surface_deviation * 0.01f * ctx.bbox_diag;
-    int effective_iters = std::max(iters + 3, 8);
+    // The public parameter and QREMESH_RELAX_ITERS override are iteration counts;
+    // do not silently force extra smoothing passes for low-detail-preservation workflows.
+    const int effective_iters = std::clamp(iters, 0, 100);
     // Conservative defaults retain local relief. Environment values are validated and
     // bounded so accidental values cannot turn this pass into an unrestricted smoother.
     float step_factor = 0.20f;

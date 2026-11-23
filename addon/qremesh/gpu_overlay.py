@@ -6,7 +6,10 @@ _draw_handler = None
 
 def draw_callback_px():
     # Overlay preview for user guide curves (Annotation strokes)
-    anim_data = getattr(bpy.context.scene, "annotation_data", None)
+    scene = bpy.context.scene
+    anim_data = getattr(scene, "annotation", None)
+    if anim_data is None:
+        anim_data = getattr(scene, "annotation_data", None)
     if not anim_data or not anim_data.layers:
         return
 
